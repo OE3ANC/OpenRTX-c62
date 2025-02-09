@@ -1,8 +1,5 @@
 /***************************************************************************
- *   Copyright (C) 2020 - 2024 by Federico Amedeo Izzo IU2NUO,             *
- *                                Niccolò Izzo IU2KIN                      *
- *                                Frederik Saraci IU2NRO                   *
- *                                Silvano Seva IU2KWO                      *
+ *   Copyright (C) 2024 by Silvano Seva IU2KWO                             *
  *                                                                         *
  *   This program is free software; you can redistribute it and/or modify  *
  *   it under the terms of the GNU General Public License as published by  *
@@ -18,43 +15,57 @@
  *   along with this program; if not, see <http://www.gnu.org/licenses/>   *
  ***************************************************************************/
 
-#ifndef HWCONFIG_H
-#define HWCONFIG_H
+#ifndef Cx000_DAC_H
+#define Cx000_DAC_H
 
-#include <MK22F51212.h>
-
-#ifdef PLATFORM_GD77
-#include "pinmap_GD77.h"
-#else
-#include "pinmap_DM1801.h"
-#endif
+#include <stdbool.h>
+#include <stdint.h>
+#include <interfaces/audio.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-extern const struct spiCustomDevice nvm_spi;
-extern const struct spiDevice c6000_spi;
+/**
+ * Driver to use the HR_Cx000 internal DAC as audio output stream device.
+ * Input data format is signed 16-bit and only a single instance of this driver
+ * is allowed.
+ */
 
-/* Screen dimensions */
-#define CONFIG_SCREEN_WIDTH 128
-#define CONFIG_SCREEN_HEIGHT 64
+extern const struct audioDriver Cx000_dac_audio_driver;
 
-/* Screen pixel format */
-#define CONFIG_PIX_FMT_BW
+/**
+ * Start generation of a "beep" tone from DAC output.
+ *
+ * @param freq: tone frequency in Hz.
+ * @return zero on success, a negative error code otherwise.
+ */
+int Cx000dac_startBeep(const uint16_t freq);
 
-/* Screen has adjustable contrast */
-#define CONFIG_SCREEN_CONTRAST
-#define CONFIG_DEFAULT_CONTRAST 71
-
-/* Screen has adjustable brightness */
-#define CONFIG_SCREEN_BRIGHTNESS
-
-/* Battery type */
-#define CONFIG_BAT_LIPO_2S
+/**
+ * Stop an ongoing "beep" tone.
+ */
+void Cx000dac_stopBeep();
 
 #ifdef __cplusplus
-}
+}   // extern "C"
+
+/**
+ * Initialize the driver.
+ */
+void Cx000dac_init(HR_C6000 *device);
+
+/**
+ * Shutdown the driver.
+ */
+void Cx000dac_terminate();
+
+/**
+ * Driver task function, to be called at least once every 4ms to ensure a
+ * proper operation.
+ */
+void Cx000dac_task();
+
 #endif
 
-#endif /* HWCONFIG_H */
+#endif /* Cx000_DAC_H */

@@ -21,7 +21,39 @@
 #include <spi_bitbang.h>
 #include <spi_custom.h>
 #include <spi_stm32.h>
+#include <adc_stm32.h>
+#include <SKY72310.h>
 #include <hwconfig.h>
 #include <pinmap.h>
 
+const struct spiConfig spiPllCfg =
+{
+    .clk       = { PLL_CLK },
+    .mosi      = { PLL_DAT },
+    .miso      = { PLL_DAT },
+    .clkPeriod = SCK_PERIOD_FROM_FREQ(1000000),
+    .flags     = SPI_HALF_DUPLEX
+};
+
+const struct spiConfig spiC5000Cfg =
+{
+    .clk       = { DMR_CLK  },
+    .mosi      = { DMR_MOSI },
+    .miso      = { DMR_MISO },
+    .clkPeriod = SCK_PERIOD_FROM_FREQ(1000000),
+    .flags     = SPI_FLAG_CPHA
+};
+
+static pthread_mutex_t adc1Mutex;
+
 SPI_STM32_DEVICE_DEFINE(nvm_spi, SPI1, NULL)
+SPI_BITBANG_DEVICE_DEFINE(pll_spi, spiPllCfg, NULL)
+SPI_BITBANG_DEVICE_DEFINE(c5000_spi, spiC5000Cfg, NULL)
+ADC_STM32_DEVICE_DEFINE(adc1, ADC1, &adc1Mutex, 3300000)
+
+const struct sky73210 pll =
+{
+    .spi    = (const struct spiDevice *) &pll_spi,
+    .cs     = { PLL_CS },
+    .refClk = 16800000
+};

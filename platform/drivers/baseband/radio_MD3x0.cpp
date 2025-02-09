@@ -1,5 +1,5 @@
 /***************************************************************************
- *   Copyright (C) 2021 - 2023 by Federico Amedeo Izzo IU2NUO,             *
+ *   Copyright (C) 2021 - 2024 by Federico Amedeo Izzo IU2NUO,             *
  *                                Niccolò Izzo IU2KIN                      *
  *                                Frederik Saraci IU2NRO                   *
  *                                Silvano Seva IU2KWO                      *
@@ -23,8 +23,9 @@
 #include <interfaces/radio.h>
 #include <peripherals/gpio.h>
 #include <calibInfo_MDx.h>
+#include <spi_bitbang.h>
+#include <adc_stm32.h>
 #include <hwconfig.h>
-#include <ADC1_MDx.h>
 #include <algorithm>
 #include <utils.h>
 #include "HR_C5000.h"
@@ -42,7 +43,7 @@ static uint8_t txpwr_hi  = 0;                   // APC voltage for TX output pow
 
 static enum opstatus radioStatus;               // Current operating status
 
-static HR_C5000& C5000 = HR_C5000::instance();  // HR_C5000 driver
+static HR_C5000 C5000((const struct spiDevice *) &c5000_spi, { DMR_CS });
 
 /*
  * Parameters for RSSI voltage (mV) to input power (dBm) conversion.
@@ -128,14 +129,13 @@ void radio_init(const rtxStatus_t *rtxState)
     nvm_readCalibData(&calData);
 
     /*
-     * Enable and configure PLL
+     * Enable and configure PLL and HR_C5000
      */
-    gpio_setPin(PLL_PWR);
-    SKY73210_init();
+    spiBitbang_init(&pll_spi);
+    spiBitbang_init(&c5000_spi);
 
-    /*
-     * Configure HR_C5000
-     */
+    gpio_setPin(PLL_PWR);
+    SKY73210_init(&pll);
     C5000.init();
 
     /*
@@ -147,7 +147,7 @@ void radio_init(const rtxStatus_t *rtxState)
 
 void radio_terminate()
 {
-    SKY73210_terminate();
+    SKY73210_terminate(&pll);
     C5000.terminate();
 
     gpio_clearPin(PLL_PWR);    // PLL off
@@ -160,29 +160,6 @@ void radio_terminate()
     DAC->DHR12R2 = 0;
     DAC->DHR12R1 = 0;
     RCC->APB1ENR &= ~RCC_APB1ENR_DACEN;
-}
-
-void radio_tuneVcxo(const int16_t vhfOffset, const int16_t uhfOffset)
-{
-    (void) vhfOffset;
-
-    /*
-     * Adjust VCXO bias voltage acting on the value stored in MCU's DAC.
-     * Data from calibration is first converted to int16_t, then the value for
-     * the DAC register is computed according to which is done inside TYT's
-     * firmware.
-     * The signed offset is then added to this value, the result is constrained
-     * in the range [0 4095], converted to uint16_t and written into the DAC
-     * register.
-     *
-     * NOTE: we deliberately chose not to update the HR_C5000 modulation offset
-     * register, as we still have to deeply understand how TYT computes
-     * the values written there.
-     */
-    int16_t calValue  = static_cast< int16_t >(calData.freqAdjustMid);
-    int16_t oscTune   = (calValue*4 + 0x600) + uhfOffset;
-    oscTune           = std::max(std::min(oscTune, int16_t(4095)), int16_t(0));
-    DAC->DHR12R2      = static_cast< uint16_t >(oscTune);
 }
 
 void radio_setOpmode(const enum opmode mode)
@@ -251,7 +228,7 @@ void radio_enableRx()
         pllFreq -= static_cast< float >(IF_FREQ);
     }
 
-    SKY73210_setFrequency(pllFreq, 5);
+    SKY73210_setFrequency(&pll, pllFreq, 5);
     DAC->DHR12L1 = vtune_rx * 0xFF;
 
     gpio_setPin(RX_STG_EN);            // Enable RX LNA
@@ -270,7 +247,7 @@ void radio_enableTx()
     // Set PLL frequency.
     float pllFreq = static_cast< float >(config->txFrequency);
     if(isVhfBand) pllFreq *= 2.0f;
-    SKY73210_setFrequency(pllFreq, 5);
+    SKY73210_setFrequency(&pll, pllFreq, 5);
 
     // Set TX output power, constrain between 1W and 5W.
     float power  = static_cast < float >(config->txPower) / 1000.0f;
@@ -406,7 +383,7 @@ rssi_t radio_getRssi()
     if(rxFreq < 401035000) offset_index = 0;
     if(rxFreq > 479995000) offset_index = 8;
 
-    float rssi_mv  = ((float) adc1_getMeasurement(ADC_RSSI_CH));
+    float rssi_mv  = ((float) adc_getVoltage(&adc1, ADC_RSSI_CH)) / 1000.0f;
     float rssi_dbm = (rssi_mv - rssi_offset[offset_index]) / rssi_gain;
     return static_cast< rssi_t >(rssi_dbm);
 }

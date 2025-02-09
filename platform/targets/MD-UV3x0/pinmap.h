@@ -97,8 +97,8 @@
 /* RTX stage control */
 #define VHF_LNA_EN GPIOA,5
 #define UHF_LNA_EN GPIOA,2
-#define PA_EN_1    GPIOC,5
-#define PA_EN_2    GPIOC,4
+#define TX_PA_EN   GPIOC,5
+#define RF_APC_SW  GPIOC,4
 #define PA_SEL_SW  GPIOC,6
 #define APC_REF    GPIOA,4
 
@@ -108,7 +108,7 @@
 
 /* HR_C6000 control interface */
 #define DMR_SLEEP GPIOE,6
-#define DMR_CS    GPIOE,2
+#define DMR_CS    &GpioE,2
 #define DMR_CLK   GPIOE,3
 #define DMR_MOSI  GPIOE,4
 #define DMR_MISO  GPIOE,5

@@ -80,7 +80,9 @@ openrtx_inc = ['openrtx/include',
                'platform/drivers/GPS',
                'platform/drivers/SPI',
                'platform/drivers/USB',
+               'platform/drivers/GPIO',
                'platform/drivers/tones',
+               'platform/drivers/audio',
                'platform/drivers/baseband',
                'platform/drivers/backlight',
                'platform/drivers/chSelector']
@@ -154,14 +156,15 @@ openrtx_def += {'GIT_VERSION': git_version}
 ## TYT MDx family
 ##
 
-mdx_src = ['platform/drivers/ADC/ADC1_MDx.c',
-           'platform/drivers/GPS/GPS_MDx.cpp',
+mdx_src = ['platform/drivers/GPS/GPS_MDx.cpp',
            'platform/drivers/NVM/W25Qx.c',
            'platform/drivers/NVM/nvmem_settings_MDx.c',
            'platform/drivers/NVM/nvmem_MDx.c',
-           'platform/drivers/audio/audio_MDx.c',
+           'platform/drivers/audio/audio_MDx.cpp',
            'platform/drivers/baseband/HR_Cx000.cpp',
-           'platform/drivers/tones/toneGenerator_MDx.cpp']
+           'platform/drivers/tones/toneGenerator_MDx.cpp',
+           'platform/drivers/SPI/spi_custom.c',
+           'platform/drivers/SPI/spi_bitbang.c']
 
 ##
 ## GDx family: Radioddity GD-77 and Baofeng DM-1801
@@ -183,7 +186,8 @@ gdx_src = ['platform/targets/GDx/platform.c',
            'platform/drivers/keyboard/keyboard_GDx.c',
            'platform/drivers/audio/audio_GDx.c',
            'platform/drivers/SPI/spi_custom.c',
-           'platform/drivers/SPI/spi_bitbang.c']
+           'platform/drivers/SPI/spi_bitbang.c',
+           'platform/drivers/SPI/spi_mk22.c']
 
 gdx_inc = ['platform/targets/GDx']
 
@@ -207,7 +211,6 @@ stm32f405_src = ['platform/mcu/STM32F4xx/boot/startup.cpp',
                  'platform/mcu/STM32F4xx/drivers/usb/usbd_ioreq.c',
                  'platform/mcu/STM32F4xx/drivers/usb/usbd_req.c',
                  'platform/mcu/STM32F4xx/drivers/usb/usbd_usr.c',
-                 'platform/mcu/STM32F4xx/drivers/gpio.c',
                  'platform/mcu/STM32F4xx/drivers/usb_vcom.c',
                  'platform/mcu/STM32F4xx/drivers/delays.cpp',
                  'platform/mcu/STM32F4xx/drivers/rtc.c',
@@ -218,6 +221,7 @@ stm32f405_src = ['platform/mcu/STM32F4xx/boot/startup.cpp',
                  'platform/mcu/STM32F4xx/drivers/i2c_stm32.c',
                  'platform/mcu/STM32F4xx/drivers/adc_stm32.c',
                  'platform/drivers/SPI/spi_stm32.c',
+                 'platform/drivers/GPIO/gpio_stm32.c',
                  'platform/drivers/audio/stm32_dac.cpp',
                  'platform/drivers/audio/stm32_adc.cpp',
                  'platform/drivers/audio/stm32_pwm.cpp',
@@ -232,6 +236,10 @@ stm32f405_inc = ['platform/mcu/CMSIS/Include',
 
 stm32f405_def = {'STM32F405xx': '', 'HSE_VALUE':'8000000'}
 
+stm32f405_src += miosix_cm4f_src
+stm32f405_inc += miosix_cm4f_inc
+stm32f405_def += miosix_cm4f_def
+
 ##
 ## MK22FN512
 ##
@@ -239,7 +247,6 @@ stm32f405_def = {'STM32F405xx': '', 'HSE_VALUE':'8000000'}
 mk22fn512_src = ['platform/mcu/MK22FN512xxx12/boot/startup.cpp',
                  'platform/mcu/MK22FN512xxx12/boot/bsp.cpp',
                  'platform/mcu/MK22FN512xxx12/boot/libc_integration.cpp',
-                 'platform/mcu/MK22FN512xxx12/drivers/gpio.c',
                  'platform/mcu/MK22FN512xxx12/drivers/delays.cpp',
                  'platform/mcu/MK22FN512xxx12/drivers/I2C0.c',
                  'platform/mcu/MK22FN512xxx12/drivers/rng.c',
@@ -251,6 +258,7 @@ mk22fn512_src = ['platform/mcu/MK22FN512xxx12/boot/startup.cpp',
                  'platform/mcu/MK22FN512xxx12/drivers/usb/usb_osa_bm.c',
                  'platform/mcu/MK22FN512xxx12/drivers/usb_vcom.c',
                  'platform/drivers/SPI/spi_mk22.c',
+                 'platform/drivers/GPIO/gpio_mk22.c',
                  'platform/mcu/CMSIS/Device/NXP/MK22FN512xxx12/Source/system_MK22F51212.c']
 
 mk22fn512_inc = ['platform/mcu/CMSIS/Include',
@@ -259,6 +267,10 @@ mk22fn512_inc = ['platform/mcu/CMSIS/Include',
                  'platform/mcu/MK22FN512xxx12/drivers']
 
 mk22fn512_def = {}
+
+mk22fn512_src += miosix_cm4f_src
+mk22fn512_inc += miosix_cm4f_inc
+mk22fn512_def += miosix_cm4f_def
 
 ##
 ## ----------------------- Platform specializations ----------------------------
@@ -344,9 +356,9 @@ md3x0_src = ['platform/drivers/CPS/cps_io_native_MD3x0.c',
 md3x0_inc = ['platform/targets/MD-3x0']
 md3x0_def = {'PLATFORM_MD3x0': '', 'timegm': 'mktime'}
 
-md3x0_src += openrtx_src + stm32f405_src + miosix_cm4f_src + ui_src_default + mdx_src
-md3x0_inc += openrtx_inc + stm32f405_inc + miosix_cm4f_inc
-md3x0_def += openrtx_def + stm32f405_def + miosix_cm4f_def
+md3x0_src += openrtx_src + stm32f405_src + ui_src_default + mdx_src
+md3x0_inc += openrtx_inc + stm32f405_inc
+md3x0_def += openrtx_def + stm32f405_def
 
 ##
 ## TYT MD-UV380
@@ -358,6 +370,7 @@ mduv3x0_src = ['platform/drivers/CPS/cps_io_native_MDUV3x0.c',
                'platform/drivers/display/HX8353_MD3x.cpp',
                'platform/drivers/backlight/backlight_MDx.c',
                'platform/drivers/chSelector/chSelector_UV3x0.c',
+               'platform/drivers/audio/Cx000_dac.cpp',
                'platform/drivers/baseband/radio_UV3x0.cpp',
                'platform/drivers/baseband/AT1846S_UV3x0.cpp',
                'platform/drivers/baseband/HR_C6000_UV3x0.cpp']
@@ -365,9 +378,9 @@ mduv3x0_src = ['platform/drivers/CPS/cps_io_native_MDUV3x0.c',
 mduv3x0_inc = ['platform/targets/MD-UV3x0']
 mduv3x0_def =  {'PLATFORM_MDUV3x0': '', 'timegm': 'mktime'}
 
-mduv3x0_src += openrtx_src + stm32f405_src + miosix_cm4f_src + ui_src_default + mdx_src
-mduv3x0_inc += openrtx_inc + stm32f405_inc + miosix_cm4f_inc
-mduv3x0_def += openrtx_def + stm32f405_def + miosix_cm4f_def
+mduv3x0_src += openrtx_src + stm32f405_src + ui_src_default + mdx_src
+mduv3x0_inc += openrtx_inc + stm32f405_inc
+mduv3x0_def += openrtx_def + stm32f405_def
 
 ##
 ## TYT MD-9600
@@ -376,6 +389,7 @@ md9600_src = ['platform/targets/MD-9600/platform.c',
               'platform/targets/MD-9600/hwconfig.c',
               'platform/drivers/display/ST7567_MD9600.c',
               'platform/drivers/keyboard/keyboard_MD9600.c',
+              'platform/drivers/backlight/backlight_MDx.c',
               'platform/drivers/chSelector/chSelector_MD9600.c',
               'platform/drivers/baseband/radio_MD9600.cpp',
               'platform/drivers/CPS/cps_io_native_MD9600.c']
@@ -383,9 +397,9 @@ md9600_src = ['platform/targets/MD-9600/platform.c',
 md9600_inc = ['platform/targets/MD-9600']
 md9600_def = {'PLATFORM_MD9600': ''}
 
-md9600_src += openrtx_src + stm32f405_src + miosix_cm4f_src + ui_src_default + mdx_src
-md9600_inc += openrtx_inc + stm32f405_inc + miosix_cm4f_inc
-md9600_def += openrtx_def + stm32f405_def + miosix_cm4f_def
+md9600_src += openrtx_src + stm32f405_src + ui_src_default + mdx_src
+md9600_inc += openrtx_inc + stm32f405_inc
+md9600_def += openrtx_def + stm32f405_def
 
 ##
 ## Radioddity GD-77
@@ -394,9 +408,9 @@ gd77_src = []
 gd77_inc = []
 gd77_def = {'PLATFORM_GD77': ''}
 
-gd77_src += openrtx_src + mk22fn512_src + miosix_cm4f_src + ui_src_default + gdx_src
-gd77_inc += openrtx_inc + mk22fn512_inc + miosix_cm4f_inc + gdx_inc
-gd77_def += openrtx_def + mk22fn512_def + miosix_cm4f_def
+gd77_src += openrtx_src + mk22fn512_src + ui_src_default + gdx_src
+gd77_inc += openrtx_inc + mk22fn512_inc + gdx_inc
+gd77_def += openrtx_def + mk22fn512_def
 
 ##
 ## Baofeng DM-1801
@@ -405,9 +419,9 @@ dm1801_src = []
 dm1801_inc = []
 dm1801_def = {'PLATFORM_DM1801': ''}
 
-dm1801_src += openrtx_src + mk22fn512_src + miosix_cm4f_src + ui_src_default + gdx_src
-dm1801_inc += openrtx_inc + mk22fn512_inc + miosix_cm4f_inc + gdx_inc
-dm1801_def += openrtx_def + mk22fn512_def + miosix_cm4f_def
+dm1801_src += openrtx_src + mk22fn512_src + ui_src_default + gdx_src
+dm1801_inc += openrtx_inc + mk22fn512_inc + gdx_inc
+dm1801_def += openrtx_def + mk22fn512_def
 
 ##
 ## Module 17
@@ -427,9 +441,9 @@ mod17_src = ['platform/targets/Module17/platform.c',
 mod17_inc = ['platform/targets/Module17']
 mod17_def = {'PLATFORM_MOD17': ''}
 
-mod17_src += openrtx_src + stm32f405_src + miosix_cm4f_src + ui_src_module17
-mod17_inc += openrtx_inc + stm32f405_inc + miosix_cm4f_inc
-mod17_def += openrtx_def + stm32f405_def + miosix_cm4f_def
+mod17_src += openrtx_src + stm32f405_src + ui_src_module17
+mod17_inc += openrtx_inc + stm32f405_inc
+mod17_def += openrtx_def + stm32f405_def
 
 ##
 ## -------------------------- Compilation arguments ----------------------------

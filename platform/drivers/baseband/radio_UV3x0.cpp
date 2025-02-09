@@ -43,7 +43,7 @@ static uint8_t txModBias  = 0;                   // VCXO bias for TX
 
 static enum opstatus radioStatus;                // Current operating status
 
-static HR_C6000& C6000  = HR_C6000::instance();  // HR_C5000 driver
+HR_C6000 C6000((const struct spiDevice *) &c6000_spi, { DMR_CS }); // HR_C6000 driver
 static AT1846S& at1846s = AT1846S::instance();   // AT1846S driver
 
 void radio_init(const rtxStatus_t *rtxState)
@@ -56,14 +56,14 @@ void radio_init(const rtxStatus_t *rtxState)
      */
     gpio_setMode(VHF_LNA_EN,   OUTPUT);
     gpio_setMode(UHF_LNA_EN,   OUTPUT);
-    gpio_setMode(PA_EN_1,      OUTPUT);
-    gpio_setMode(PA_EN_2,      OUTPUT);
+    gpio_setMode(TX_PA_EN,     OUTPUT);
+    gpio_setMode(RF_APC_SW,    OUTPUT);
     gpio_setMode(PA_SEL_SW,    OUTPUT);
 
     gpio_clearPin(VHF_LNA_EN);
     gpio_clearPin(UHF_LNA_EN);
-    gpio_clearPin(PA_EN_1);
-    gpio_clearPin(PA_EN_2);
+    gpio_clearPin(TX_PA_EN);
+    gpio_clearPin(RF_APC_SW);
     gpio_clearPin(PA_SEL_SW);
 
     // TODO: keep audio connected to HR_C6000, for volume control
@@ -85,10 +85,10 @@ void radio_init(const rtxStatus_t *rtxState)
     nvm_readCalibData(&calData);
 
     /*
-     * Configure AT1846S and HR_C6000, keep AF output disabled at power on.
+     * Initialize AT1846S keep AF output disabled at power on.
+     * HR_C6000 is initialized in advance by the audio system.
      */
     at1846s.init();
-    C6000.init();
     radio_disableAfOutput();
 }
 
@@ -100,14 +100,6 @@ void radio_terminate()
 
     DAC->DHR12R1 = 0;
     RCC->APB1ENR &= ~RCC_APB1ENR_DACEN;
-}
-
-void radio_tuneVcxo(const int16_t vhfOffset, const int16_t uhfOffset)
-{
-    //TODO: this part will be implemented in the future, when proved to be
-    // necessary.
-    (void) vhfOffset;
-    (void) uhfOffset;
 }
 
 void radio_setOpmode(const enum opmode mode)
@@ -145,20 +137,22 @@ bool radio_checkRxDigitalSquelch()
 
 void radio_enableAfOutput()
 {
-    // Bit 2 of register 0x36: enable voice channel in FM mode
+    // Undocumented register, bits [1:0] seem to enable/disable FM audio RX.
     // TODO: AF output management for DMR mode
-    C6000.writeCfgRegister(0x36, 0x02);
+    // 0xFD enable FM receive.
+    C6000.writeCfgRegister(0x26, 0xFD);
 }
 
 void radio_disableAfOutput()
 {
-    C6000.writeCfgRegister(0x36, 0x00);
+    // Undocumented register, disable FM receive
+    C6000.writeCfgRegister(0x26, 0xFE);
 }
 
 void radio_enableRx()
 {
-    gpio_clearPin(PA_EN_1);
-    gpio_clearPin(PA_EN_2);
+    gpio_clearPin(TX_PA_EN);
+    gpio_clearPin(RF_APC_SW);
     gpio_clearPin(VHF_LNA_EN);
     gpio_clearPin(UHF_LNA_EN);
     DAC->DHR12R1 = 0;
@@ -168,18 +162,6 @@ void radio_enableRx()
     C6000.setModOffset(rxModBias);
     at1846s.setFrequency(config->rxFrequency);
     at1846s.setFuncMode(AT1846S_FuncMode::RX);
-
-    /*
-     * Force silencing of audio output when RX is enabled with M17 operating
-     * mode selected. Avoids the spillover of baseband signal towards the
-     * speaker.
-     *
-     * TODO: improve this solution.
-     */
-    if(config->opMode == OPMODE_M17)
-    {
-        C6000.writeCfgRegister(0xE0, 0x00);
-    }
 
     if(currRxBand == BND_VHF)
     {
@@ -204,8 +186,8 @@ void radio_enableTx()
 
     gpio_clearPin(VHF_LNA_EN);
     gpio_clearPin(UHF_LNA_EN);
-    gpio_clearPin(PA_EN_1);
-    gpio_clearPin(PA_EN_2);
+    gpio_clearPin(TX_PA_EN);
+    gpio_clearPin(RF_APC_SW);
 
     C6000.setModOffset(txModBias);
     at1846s.setFrequency(config->txFrequency);
@@ -255,8 +237,8 @@ void radio_enableTx()
         gpio_setPin(PA_SEL_SW);
     }
 
-    gpio_setPin(PA_EN_1);
-    gpio_setPin(PA_EN_2);
+    gpio_setPin(TX_PA_EN);
+    gpio_setPin(RF_APC_SW);
 
     if(config->txToneEn)
     {
@@ -275,8 +257,8 @@ void radio_disableRtx()
 {
     gpio_clearPin(VHF_LNA_EN);
     gpio_clearPin(UHF_LNA_EN);
-    gpio_clearPin(PA_EN_1);
-    gpio_clearPin(PA_EN_2);
+    gpio_clearPin(TX_PA_EN);
+    gpio_clearPin(RF_APC_SW);
     DAC->DHR12L1 = 0;
 
     // If we are currently transmitting, stop tone and C6000 TX
