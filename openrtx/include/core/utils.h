@@ -29,6 +29,14 @@ extern "C" {
 #endif
 
 /**
+ * Get the number of elements of an array.
+ *
+ * @param x: array.
+ * @return number of elements.
+ */
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+
+/**
  * This function allows to obtain the value of a given calibration parameter for
  * frequencies outside the calibration points. It works by searching the two
  * calibration points containing the target frequency and then by linearly
@@ -73,6 +81,14 @@ void stripTrailingZeroes(char *str);
  * @return S level, from S0 to S11
  */
 uint8_t rssiToSlevel(const rssi_t rssi);
+
+/**
+ * Retrieve the CTCSS tone index given its frequency in tenths of Hz.
+ *
+ * @param freq: CTCSS frequency
+ * @return tone index or 255 if the tone has not been found
+ */
+uint8_t ctcssFreqToIndex(const uint16_t freq);
 
 #ifdef __cplusplus
 }
