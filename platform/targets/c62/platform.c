@@ -92,9 +92,6 @@ void platform_set_display_brightness(uint8_t brightness_percent)
 
     if (ret < 0) {
         printk("Failed to set display PWM: %d\n", ret);
-    } else {
-        printk("Display brightness set to %d%% (PWM %d%%)\n",
-               brightness_percent, adjusted_brightness_percent);
     }
 }
 
@@ -106,8 +103,6 @@ void platform_set_display_brightness(uint8_t brightness_percent)
  */
 void platform_set_tx_power(uint8_t power_percent)
 {
-    printk("Requested TX power: %d%%\n", power_percent);
-
     //TODO: Check if this works... May need to adjust mapping of power_percent to duty cycle based on actual power output
     //      vs duty cycle curve of the PA, and also consider frequency dependence of PA efficiency
 
@@ -119,15 +114,11 @@ void platform_set_tx_power(uint8_t power_percent)
 
     if (ret < 0) {
         printk("Failed to set TX power PWM: %d\n", ret);
-    } else {
-        printk("TX power set to %d%%\n", power_percent);
     }
 }
 
 void platform_init_csk6()
 {
-    printk("0x49 de OE3ANC from OPENRTX on the C62\n");
-
     // Configure the PTT key as input with pull-up
     gpio_pin_configure_dt(&button_ptt, GPIO_INPUT);
 
@@ -189,11 +180,6 @@ static int battery_init(void)
 
     // Read ADC reference voltage if supported
     adc_vref = adc_ref_internal(adc_dev);
-    if (adc_vref > 0) {
-        printk("ADC reference voltage: %d mV\n", adc_vref);
-    } else {
-        printk("ADC reference voltage not available\n");
-    }
 
     return 0;
 }
