@@ -37,6 +37,7 @@ if (${BOARD} STREQUAL "c62")
     list(APPEND ZEPHYR_EXTRA_MODULES ${CMAKE_CURRENT_LIST_DIR}/../modules/lib/urpc)
 
     list(APPEND ZEPHYR_EXTRA_MODULES ${CMAKE_CURRENT_LIST_DIR}/platform/drivers-zephyr/baseband/bk4819)
+    list(APPEND ZEPHYR_EXTRA_MODULES ${CMAKE_CURRENT_LIST_DIR}/platform/drivers-zephyr/baseband/bk1080)
 endif()
 
 #
