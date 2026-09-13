@@ -40,3 +40,66 @@ config LSF_SERVICE_CONTROLLER
 if LSF_SERVICE_CONTROLLER
 rsource "services/Kconfig"
 endif # LSF_SERVICE_CONTROLLER
+
+menu "C62 M17 baseband calibration"
+    depends on SOC_CSK6
+
+config C62_M17_DEVIATION
+    hex "BK4819 M17 deviation register field"
+    range 0x0 0x0fff
+    default 0x04d2
+    help
+      Raw REG_40 bits 11:0, not Hz. Bit 12 enables modulation and is
+      always set by the driver. The starting value matches C62's
+      existing setting and requires RF calibration with the DSP output.
+      Do not substitute values calibrated for an external TNC4.
+
+config C62_TX_BASEBAND_LEVEL_PERCENT
+    int "MCU to radio baseband PCM level (%)"
+    range 1 100
+    default 100
+    help
+      Scale software-generated TX baseband before resampling and DAC output.
+      50 is approximately -6 dB. Analog FM bypass and speaker audio are
+      unaffected. Calibrate this input level before RF deviation gain.
+
+config C62_TX_BASEBAND_INVERT
+    bool "Invert MCU to radio TX baseband polarity"
+    default n
+    help
+      Negate software-generated TX baseband, exchanging +3/-3 and +1/-1.
+      Equivalent to the Module17 TX phase inversion option. RX, speaker
+      audio and the analog FM bypass are unaffected.
+
+config C62_RX_BASEBAND_INVERT
+    bool "Invert radio to MCU RX baseband polarity"
+    default n
+    help
+      Negate received baseband after resampling, equivalent to Module17's
+      RX phase inversion. Microphone, FM bypass and TX are unaffected.
+
+config C62_M17_RX_GAIN1
+    int "M17 BK4819 RX attenuation (6 dB steps)"
+    range 0 3
+    default 0
+    help
+      REG_48 bits 11:10: 0 = 0 dB, 1 = -6 dB, 2 = -12 dB, 3 = -18 dB.
+      Reduces the analog output feeding the DSP ADC. FM settings are saved
+      and restored when leaving M17. TX modulation is unaffected.
+
+config C62_RX_LEVEL_DIAGNOSTICS
+    bool "Log raw RX baseband levels once per second"
+    default n
+    help
+      While a software RX stream is running, report raw DSP PCM minimum,
+      maximum, mean and near-rail samples before resampling or inversion.
+
+config C62_MIC_BIAS_SETTLE_MS
+    int "BK4819 microphone bias settling time (ms)"
+    range 1 5000
+    default 250
+    help
+      Startup delay with MIC ADC enabled and RX DSP disabled. Mobilinkd
+      measured 250 ms with 1 uF coupling; verify for the C62 circuit.
+
+endmenu
