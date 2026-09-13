@@ -7,6 +7,7 @@
 
 #include <zephyr/init.h>
 #include <zephyr/device.h>
+#include <zephyr/sys/util.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(dsp, LOG_LEVEL_DBG);
@@ -20,6 +21,17 @@ LOG_MODULE_REGISTER(dsp, LOG_LEVEL_DBG);
 #define AP_SYS_RAM_BANK_SIZE 0x00010000
 #define AP_SYS_RAM_BANK_ADDR \
     (SYS_RAM_BASE + AP_SYS_RAM_BANK_SIZE * AP_SYS_RAM_BANK_IDX)
+
+/* SRAM's code and data aliases differ by bit 29 in the SDK memory map. */
+#define AP_RAM_CANONICAL_ADDR(addr) ((addr) & ~0x20000000UL)
+#define AP_RAM_START AP_RAM_CANONICAL_ADDR(CONFIG_SRAM_BASE_ADDRESS)
+#define AP_RAM_END (AP_RAM_START + CONFIG_SRAM_SIZE * 1024UL)
+#define DSP_RAM_START AP_RAM_CANONICAL_ADDR(AP_SYS_RAM_BANK_ADDR)
+#define DSP_RAM_END (DSP_RAM_START + AP_SYS_RAM_BANK_SIZE)
+
+/* Check the SRAM bounds used by both the linker and newlib's heap. */
+BUILD_ASSERT(AP_RAM_END <= DSP_RAM_START || AP_RAM_START >= DSP_RAM_END,
+             "Application SRAM overlaps DSP shared audio bank 4");
 
 #define AP_PSRAM_BASE (0x30000000)
 #define CP_PSRAM_BASE (0x60000000)
