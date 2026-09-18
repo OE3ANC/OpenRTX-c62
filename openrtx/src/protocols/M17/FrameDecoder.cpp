@@ -12,6 +12,9 @@
 #include "protocols/M17/Constants.hpp"
 #include "protocols/M17/Utils.hpp"
 #include <algorithm>
+#ifdef M17_RX_DIAGNOSTICS
+#include <cstdio>
+#endif
 
 using namespace M17;
 
@@ -25,6 +28,9 @@ FrameDecoder::~FrameDecoder()
 
 void FrameDecoder::reset()
 {
+#ifdef M17_RX_DIAGNOSTICS
+    diagnostics = {};
+#endif
     lsfSegmentMap = 0;
     lsf.clear();
     lsfFromLich.clear();
@@ -66,6 +72,20 @@ FrameType FrameDecoder::decodeFrame(const frame_t &frame)
             break;
     }
 
+#ifdef M17_RX_DIAGNOSTICS
+    diagnostics.streams += type == FrameType::STREAM;
+    diagnostics.unknown += type == FrameType::UNKNOWN;
+    if (++diagnostics.frames == 25) {
+        printf("M17 DEC frames=25 stream=%u unknown=%u lsf=%u/%u "
+               "lich=%u/%u rebuilt=%u/%u viterbi_max=%u map=%02x valid=%u\n",
+               diagnostics.streams, diagnostics.unknown, diagnostics.lsfOk,
+               diagnostics.lsfBad, diagnostics.lichOk, diagnostics.lichBad,
+               diagnostics.rebuiltOk, diagnostics.rebuiltBad,
+               diagnostics.viterbiMax, (unsigned int)lsfSegmentMap,
+               (unsigned int)lsf.valid());
+        diagnostics = {};
+    }
+#endif
     return type;
 }
 
@@ -127,6 +147,12 @@ void FrameDecoder::decodeLSF(const std::array<uint8_t, 46> &data)
 
     viterbi.decodePunctured(data, tmp, LSF_PUNCTURE);
     memcpy(&lsf.data, tmp.data(), tmp.size());
+#ifdef M17_RX_DIAGNOSTICS
+    if (lsf.valid())
+        diagnostics.lsfOk++;
+    else
+        diagnostics.lsfBad++;
+#endif
 }
 
 void FrameDecoder::decodePacket(const std::array<uint8_t, 46> &data)
@@ -162,6 +188,12 @@ void FrameDecoder::decodeStream(const std::array<uint8_t, 46> &data)
 
     std::copy_n(data.begin(), lich.size(), lich.begin());
     bool decodeOk = decodeLich(lsfSegment, lich);
+#ifdef M17_RX_DIAGNOSTICS
+    if (decodeOk)
+        diagnostics.lichOk++;
+    else
+        diagnostics.lichBad++;
+#endif
 
     if (decodeOk) {
         // Append LICH segment
@@ -176,6 +208,12 @@ void FrameDecoder::decodeStream(const std::array<uint8_t, 46> &data)
 
         // Check if we have received all the six LICH segments
         if (lsfSegmentMap == 0x3F) {
+#ifdef M17_RX_DIAGNOSTICS
+            if (lsfFromLich.valid())
+                diagnostics.rebuiltOk++;
+            else
+                diagnostics.rebuiltBad++;
+#endif
             if (lsfFromLich.valid())
                 lsf = lsfFromLich;
             lsfSegmentMap = 0;
@@ -193,6 +231,10 @@ void FrameDecoder::decodeStream(const std::array<uint8_t, 46> &data)
 
     // Skip payload copy if BER is too high to avoid audio artifacts
     uint16_t bitErrs = viterbi.decodePunctured(punctured, tmp, DATA_PUNCTURE);
+#ifdef M17_RX_DIAGNOSTICS
+    if (bitErrs > diagnostics.viterbiMax)
+        diagnostics.viterbiMax = bitErrs;
+#endif
     if (bitErrs < MAX_VITERBI_ERRORS)
         memcpy(&streamFrame.frameData, tmp.data(), tmp.size());
 }

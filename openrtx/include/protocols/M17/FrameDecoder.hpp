@@ -93,6 +93,20 @@ public:
     }
 
 private:
+#ifdef M17_RX_DIAGNOSTICS
+    struct {
+        unsigned int frames;
+        unsigned int streams;
+        unsigned int unknown;
+        unsigned int lsfOk;
+        unsigned int lsfBad;
+        unsigned int lichOk;
+        unsigned int lichBad;
+        unsigned int rebuiltOk;
+        unsigned int rebuiltBad;
+        unsigned int viterbiMax;
+    } diagnostics{};
+#endif
     /**
      * Determine frame type by searching which syncword among the standard M17
      * ones has the minumum hamming distance from the given one. If the hamming

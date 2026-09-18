@@ -217,8 +217,7 @@ bool radio_checkRxDigitalSquelch()
 
 void radio_enableAfOutput()
 {
-    bk4819_set_modulation(&c62_bk4819, true);
-    return;
+    BK4819_SetAF(&c62_bk4819, radioMode == OPMODE_M17 ? 9 : 1);
 }
 
 void radio_disableAfOutput()

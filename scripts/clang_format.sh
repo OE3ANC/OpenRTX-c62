@@ -55,7 +55,6 @@ openrtx/include/core/iir.hpp
 openrtx/include/core/queue.h
 openrtx/include/core/ringbuf.hpp
 openrtx/include/core/settings.h
-openrtx/include/core/threads.h
 openrtx/include/interfaces/keyboard.h
 openrtx/include/interfaces/platform.h
 openrtx/include/peripherals/adc.h
@@ -70,7 +69,6 @@ openrtx/include/protocols/M17/Correlator.hpp
 openrtx/include/protocols/M17/DSP.hpp
 openrtx/include/protocols/M17/Datatypes.hpp
 openrtx/include/protocols/M17/Decorrelator.hpp
-openrtx/include/protocols/M17/Demodulator.hpp
 openrtx/include/protocols/M17/DevEstimator.hpp
 openrtx/include/protocols/M17/FrameEncoder.hpp
 openrtx/include/protocols/M17/Golay.hpp
@@ -108,7 +106,6 @@ openrtx/src/core/utils.c
 openrtx/src/core/xmodem.c
 openrtx/src/main.c
 openrtx/src/protocols/M17/DSP.cpp
-openrtx/src/protocols/M17/Demodulator.cpp
 openrtx/src/protocols/M17/FrameEncoder.cpp
 openrtx/src/protocols/M17/Golay.cpp
 openrtx/src/protocols/M17/LinkSetupFrame.cpp

@@ -42,3 +42,8 @@ target_include_directories(app
 )
 
 target_compile_definitions(app PRIVATE PLATFORM_C62)
+if(CONFIG_C62_RX_LEVEL_DIAGNOSTICS)
+    # Newlib printf needs extra stack below the frame-decoder call chain.
+    target_compile_definitions(app PRIVATE
+        M17_RX_DIAGNOSTICS RTX_THREAD_STKSIZE=4096)
+endif()

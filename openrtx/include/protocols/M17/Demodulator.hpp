@@ -33,7 +33,6 @@ namespace M17
 class Demodulator
 {
 public:
-
     /**
      * Constructor.
      */
@@ -70,7 +69,7 @@ public:
      * @return reference to the internal data structure containing the last
      * decoded frame.
      */
-    const frame_t& getFrame();
+    const frame_t &getFrame();
 
     /**
      * Demodulates data from the ADC and fills the idle frame.
@@ -95,7 +94,6 @@ public:
     bool isLocked();
 
 private:
-
     /**
      * Quantize a given sample to its corresponding symbol and append it to the
      * ongoing frame. When a frame is complete, it swaps the pointers and updates
@@ -145,17 +143,17 @@ private:
      * M17 baseband signal sampled at 24kHz, half of an M17 frame is processed
      * at each update of the demodulator.
      */
-    static constexpr size_t  RX_SAMPLE_RATE     = 24000;
-    static constexpr size_t  SAMPLES_PER_SYMBOL = RX_SAMPLE_RATE / SYMBOL_RATE;
-    static constexpr size_t  FRAME_SAMPLES      = FRAME_SYMBOLS * SAMPLES_PER_SYMBOL;
-    static constexpr size_t  SAMPLE_BUF_SIZE    = FRAME_SAMPLES / 2;
-    static constexpr size_t  SYNCWORD_SAMPLES   = SAMPLES_PER_SYMBOL * SYNCWORD_SYMBOLS;
+    static constexpr size_t RX_SAMPLE_RATE = 24000;
+    static constexpr size_t SAMPLES_PER_SYMBOL = RX_SAMPLE_RATE / SYMBOL_RATE;
+    static constexpr size_t FRAME_SAMPLES = FRAME_SYMBOLS * SAMPLES_PER_SYMBOL;
+    static constexpr size_t SAMPLE_BUF_SIZE = FRAME_SAMPLES / 2;
+    static constexpr size_t SYNCWORD_SAMPLES = SAMPLES_PER_SYMBOL
+                                             * SYNCWORD_SYMBOLS;
 
     /**
      * Internal state of the demodulator.
      */
-    enum class DemodState
-    {
+    enum class DemodState {
         INIT,       ///< Initializing
         UNLOCKED,   ///< Not locked
         SYNCED,     ///< Synchronized, validate syncword
@@ -166,34 +164,58 @@ private:
     /**
      * Cofficients of the sample filter
      */
-    static constexpr std::array < float, 3 > sfNum = {4.24433681e-05f, 8.48867363e-05f, 4.24433681e-05f};
-    static constexpr std::array < float, 3 > sfDen = {1.0f,           -1.98148851f,     0.98165828f};
+    static constexpr std::array<float, 3> sfNum = { 4.24433681e-05f,
+                                                    8.48867363e-05f,
+                                                    4.24433681e-05f };
+    static constexpr std::array<float, 3> sfDen = { 1.0f, -1.98148851f,
+                                                    0.98165828f };
 
-    DemodState                     demodState;      ///< Demodulator state
-    std::unique_ptr< int16_t[] >   baseband_buffer; ///< Buffer for baseband audio handling.
-    streamId                       basebandId;      ///< Id of the baseband input stream.
-    pathId                         basebandPath;    ///< Id of the baseband input path.
-    std::unique_ptr<frame_t >      demodFrame;      ///< Frame being demodulated.
-    std::unique_ptr<frame_t >      readyFrame;      ///< Fully demodulated frame to be returned.
-    bool                           newFrame;        ///< A new frame has been fully decoded.
-    bool                           resetClockRec;   ///< Clock recovery reset request.
-    bool                           updateSampPoint; ///< Sampling point update pending.
-    uint16_t                       frameIndex;      ///< Index for filling the raw frame.
-    uint32_t                       sampleIndex;     ///< Sample index, from 0 to (SAMPLES_PER_SYMBOL - 1)
-    uint32_t                       samplingPoint;   ///< Symbol sampling point
-    uint32_t                       sampleCount;     ///< Free-running sample counter
-    uint8_t                        missedSyncs;     ///< Counter of missed synchronizations
-    uint32_t                       initCount;       ///< Downcounter for initialization
-    float                          corrThreshold;   ///< Correlation threshold
-    struct dcBlock                 dcBlock;         ///< State of the DC removal filter
+    DemodState demodState; ///< Demodulator state
+    std::unique_ptr<int16_t[]>
+        baseband_buffer;   ///< Buffer for baseband audio handling.
+    streamId basebandId;   ///< Id of the baseband input stream.
+    pathId basebandPath;   ///< Id of the baseband input path.
+    std::unique_ptr<frame_t> demodFrame; ///< Frame being demodulated.
+    std::unique_ptr<frame_t>
+        readyFrame;       ///< Fully demodulated frame to be returned.
+    bool newFrame;        ///< A new frame has been fully decoded.
+    bool resetClockRec;   ///< Clock recovery reset request.
+    bool updateSampPoint; ///< Sampling point update pending.
+    uint16_t frameIndex;  ///< Index for filling the raw frame.
+    uint32_t sampleIndex; ///< Sample index, from 0 to (SAMPLES_PER_SYMBOL - 1)
+    uint32_t samplingPoint; ///< Symbol sampling point
+    uint32_t sampleCount;   ///< Free-running sample counter
+    uint8_t missedSyncs;    ///< Counter of missed synchronizations
+    uint32_t initCount;     ///< Downcounter for initialization
+    float corrThreshold;    ///< Correlation threshold
+    struct dcBlock dcBlock; ///< State of the DC removal filter
 
-    Correlator   < SYNCWORD_SYMBOLS, SAMPLES_PER_SYMBOL > correlator;
-    Synchronizer < SYNCWORD_SYMBOLS, SAMPLES_PER_SYMBOL > lsfSync   {{ +3, +3, +3, +3, -3, -3, +3, -3 }};
-    Synchronizer < SYNCWORD_SYMBOLS, SAMPLES_PER_SYMBOL > streamSync{{ -3, -3, -3, -3, +3, +3, -3, +3 }};
-    Synchronizer < SYNCWORD_SYMBOLS, SAMPLES_PER_SYMBOL > packetSync{{ +3, -3, +3, +3, -3, -3, -3, -3 }};
-    Iir          < 3 >                                        sampleFilter{sfNum, sfDen};
-    DevEstimator                                              devEstimator;
-    ClockRecovery< SAMPLES_PER_SYMBOL >                       clockRec;
+#ifdef M17_RX_DIAGNOSTICS
+    struct {
+        unsigned int samples;
+        unsigned int candidates;
+        unsigned int locks;
+        unsigned int losses;
+        unsigned int frames;
+        unsigned int inputPeak;
+        unsigned int rrcOverrange;
+        bool inputError;
+    } diagnostics{};
+#endif
+
+    Correlator<SYNCWORD_SYMBOLS, SAMPLES_PER_SYMBOL> correlator;
+    Synchronizer<SYNCWORD_SYMBOLS, SAMPLES_PER_SYMBOL> lsfSync{
+        { +3, +3, +3, +3, -3, -3, +3, -3 }
+    };
+    Synchronizer<SYNCWORD_SYMBOLS, SAMPLES_PER_SYMBOL> streamSync{
+        { -3, -3, -3, -3, +3, +3, -3, +3 }
+    };
+    Synchronizer<SYNCWORD_SYMBOLS, SAMPLES_PER_SYMBOL> packetSync{
+        { +3, -3, +3, +3, -3, -3, -3, -3 }
+    };
+    Iir<3> sampleFilter{ sfNum, sfDen };
+    DevEstimator devEstimator;
+    ClockRecovery<SAMPLES_PER_SYMBOL> clockRec;
 };
 
 } /* M17 */
