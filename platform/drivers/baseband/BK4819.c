@@ -294,9 +294,15 @@ void bk4819_set_Squelch(const struct BK4819 *dev, uint8_t RTSO, uint8_t RTSC,
                         uint8_t ETSO, uint8_t ETSC, uint8_t GTSO, uint8_t GTSC)
 {
     BK4819_writeReg(dev, BK4819_REG_78, (RTSO << 8) | RTSC);
-    BK4819_writeReg(dev, BK4819_REG_4F, (ETSC << 8) | ETSO);
-    BK4819_writeReg(dev, BK4819_REG_4D, GTSC);
-    BK4819_writeReg(dev, BK4819_REG_4E, GTSO);
+
+    // Only change threshold fields; preserve timing and reserved bits.
+    uint16_t value = BK4819_readReg(dev, BK4819_REG_4F);
+    BK4819_writeReg(dev, BK4819_REG_4F,
+                    (value & 0x8080) | ((ETSC & 0x7f) << 8) | (ETSO & 0x7f));
+    value = BK4819_readReg(dev, BK4819_REG_4D);
+    BK4819_writeReg(dev, BK4819_REG_4D, (value & 0xff00) | GTSC);
+    value = BK4819_readReg(dev, BK4819_REG_4E);
+    BK4819_writeReg(dev, BK4819_REG_4E, (value & 0xff00) | GTSO);
 }
 
 int16_t bk4819_get_rssi(const struct BK4819 *dev)

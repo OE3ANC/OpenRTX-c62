@@ -30,7 +30,9 @@ static enum opmode radioMode = OPMODE_FM;
 /*
  * Flat baseband register fields documented by Rob Riggs, WX9O (Mobilinkd):
  * https://github.com/egzumer/uv-k5-firmware-custom/pull/583
- * Preserve C62's other fields, including RX polarity and analog gain.
+ * M17 RX uses AF9, REG_47 bit 1 and RX gain2=0x3f as described at
+ * https://wiki.m17foundation.org/index.php?title=A36Plus
+ * Preserve other C62 fields and restore the saved values for FM/TX.
  * REG_40 is a raw calibration value, not a deviation expressed in Hz.
  */
 static const struct {
@@ -46,8 +48,8 @@ static const struct {
       BK4819_REG40_TX_DEVIATION_ENABLE | CONFIG_C62_M17_DEVIATION },
     // 4.5 kHz RF / 3.75 kHz weak-signal filter, 12.5 kHz channel
     { BK4819_REG_43, 0x7ffc, 0x7808 },
-    { BK4819_REG_47, 0x0001, 0x0001 }, // Bypass TX audio low-pass filter
-    { BK4819_REG_48, 0x0c00, CONFIG_C62_M17_RX_GAIN1 << 10 },
+    { BK4819_REG_47, 0x0003, 0x0001 }, // Save bit 1; bypass TX filter
+    { BK4819_REG_48, 0x0ff0, CONFIG_C62_M17_RX_GAIN1 << 10 },
     { BK4819_REG_4B, 0x0020, 0x0020 }, // Disable audio limiter
     { BK4819_REG_50, 0x8000, 0x0000 }, // Unmute TX after local beeps
     { BK4819_REG_70, 0x8080, 0x0000 }, // Disable tone generators
@@ -64,6 +66,10 @@ static void apply_digital_profile(bool transmit)
         const auto &field = digitalProfile[i];
         uint16_t value = BK4819_readReg(&c62_bk4819, field.reg);
         uint16_t digital = field.digital;
+        if (field.reg == BK4819_REG_47)
+            digital |= transmit ? (fmProfile[i] & 0x0002) : 0x0002;
+        if (field.reg == BK4819_REG_48)
+            digital |= transmit ? (fmProfile[i] & 0x03f0) : 0x03f0;
         if (field.reg == BK4819_REG_7E && transmit)
             digital |= 0x8000; // Fixed gain during TX only
         BK4819_writeReg(&c62_bk4819, field.reg,
@@ -146,6 +152,9 @@ void radio_init(const rtxStatus_t *rtxState)
     radioMode = OPMODE_FM;
 
     BK4819_SetAF(&c62_bk4819, 0);
+
+    // OpenRTX handles squelch in every mode; keep hardware squelch open.
+    bk4819_set_Squelch(&c62_bk4819, 0, 0, 0x7f, 0x7f, 0xff, 0xff);
 
     bk4819_gpio_pin_set(&c62_bk4819, GPIO_VHF_RX_LNA,
                         false); // VHF RX LNA
@@ -313,8 +322,8 @@ void radio_enableTx()
     // depending on power level set PWM duty cycle for APC voltage control
     // Maybe need table for this instead of crude linear mapping, and also consider frequency dependence of PA efficiency
     platform_set_tx_power(std::min(
-        config->txPower * 100 / 5000,
-        100U)); // crude linear mapping of power to duty cycle, max at 5W
+        config->txPower * config->txPower * 100 / (5000 * 5000),
+    100U)); // crude quadratic mapping of power to duty cycle, max at 5W
 
     bk4819_tx_on(&c62_bk4819);
     radioStatus = TX;
@@ -341,15 +350,6 @@ void radio_disableRtx()
 
 void radio_updateConfiguration()
 {
-    // M17 owns squelch in software; feed it continuous discriminator audio.
-    if (radioMode == OPMODE_M17) {
-        bk4819_set_Squelch(&c62_bk4819, 0, 0, 0x7f, 0x7f, 0xff, 0xff);
-    } else {
-        int squelch = -127 + (config->sqlLevel * 66) / 15;
-        bk4819_set_Squelch(&c62_bk4819, ((squelch + 160) * 2),
-                           ((squelch - 3 + 160) * 2), 0x5f, 0x5e, 0x20, 0x08);
-    }
-
     // Set BK4819 PA Gain tuning according to TX power and frequency
 
     radio_setBandwidth(config->bandwidth);

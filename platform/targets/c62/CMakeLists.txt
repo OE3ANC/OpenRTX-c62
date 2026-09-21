@@ -41,9 +41,5 @@ target_include_directories(app
     ${OPENRTX_ROOT}/platform/targets/c62
 )
 
-target_compile_definitions(app PRIVATE PLATFORM_C62)
-if(CONFIG_C62_RX_LEVEL_DIAGNOSTICS)
-    # Newlib printf needs extra stack below the frame-decoder call chain.
-    target_compile_definitions(app PRIVATE
-        M17_RX_DIAGNOSTICS RTX_THREAD_STKSIZE=4096)
-endif()
+# Preserve the M17 radio thread stack size used during RX validation.
+target_compile_definitions(app PRIVATE PLATFORM_C62 RTX_THREAD_STKSIZE=4096)

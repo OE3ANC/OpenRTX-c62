@@ -15,6 +15,8 @@
 #include "AudioTrack.h"
 #include "AudioRecord.h"
 #include "audio_resampler.h"
+#include "rx_baseband.h"
+#include "rx_equalizer.h"
 
 LOG_MODULE_REGISTER(c62_audio, LOG_LEVEL_INF);
 
@@ -33,6 +35,8 @@ struct sample_queue {
 struct audio_stream {
     struct streamCtx *ctx;
     struct c62_resampler converter;
+    struct c62_rx_baseband rx_baseband;
+    struct c62_rx_equalizer rx_equalizer;
     struct sample_queue queue;
     struct k_sem wake;
     bool input;
@@ -121,37 +125,6 @@ static void stream_detach(struct audio_stream *stream)
     k_sem_give(&stream->wake);
 }
 
-#ifdef CONFIG_C62_RX_LEVEL_DIAGNOSTICS
-static struct {
-    uint32_t count;
-    uint32_t near_rail;
-    int32_t sum;
-    int16_t minimum;
-    int16_t maximum;
-} rx_level;
-
-static void measure_rx_level(int16_t sample)
-{
-    if (rx_level.count == 0) {
-        rx_level.minimum = INT16_MAX;
-        rx_level.maximum = INT16_MIN;
-        rx_level.sum = 0;
-        rx_level.near_rail = 0;
-    }
-    rx_level.minimum = MIN(rx_level.minimum, sample);
-    rx_level.maximum = MAX(rx_level.maximum, sample);
-    rx_level.sum += sample;
-    if (sample >= 32700 || sample <= -32700)
-        rx_level.near_rail++;
-    if (++rx_level.count == SAMPLE_RATE) {
-        LOG_INF("RX PCM min=%d max=%d mean=%d near_rail=%u/%u",
-                rx_level.minimum, rx_level.maximum, rx_level.sum / SAMPLE_RATE,
-                rx_level.near_rail, rx_level.count);
-        rx_level.count = 0;
-    }
-}
-#endif
-
 /*
  * AudioRecord_read() waits indefinitely and copies whole DSP frames even when
  * the requested size is smaller. Use the same ICStream transport nonblocking,
@@ -187,10 +160,6 @@ static void capture_frame(void)
             int16_t sample =
                 samples[i * channels + record.mChannelOutIdx[source]];
             if (stream->ctx != NULL && stream->ctx->running) {
-#ifdef CONFIG_C62_RX_LEVEL_DIAGNOSTICS
-                if (source == SOURCE_RTX)
-                    measure_rx_level(sample);
-#endif
                 queue_push(&stream->queue, sample);
             }
             for (unsigned int sink = 0; sink < 2; sink++) {
@@ -278,10 +247,8 @@ static int stream_start(const uint8_t instance, const void *config,
         ret = -EINVAL;
     } else {
         stream->ctx = ctx;
-#ifdef CONFIG_C62_RX_LEVEL_DIAGNOSTICS
-        if (input && instance == SOURCE_RTX)
-            rx_level.count = 0;
-#endif
+        c62_rx_baseband_reset(&stream->rx_baseband);
+        c62_rx_equalizer_reset(&stream->rx_equalizer);
         stream->half = stream->data_half = 0;
         stream->error = 0;
         stream->converted_count = stream->converted_pos = 0;
@@ -337,11 +304,13 @@ static int capture_samples(struct audio_stream *stream, struct streamCtx *ctx,
             while (stream->converted_pos < stream->converted_count
                    && filled < count) {
                 int32_t sample = stream->converted[stream->converted_pos++];
-#ifdef CONFIG_C62_RX_BASEBAND_INVERT
-                /* Invert only software RX baseband, not MIC or FM bypass. */
-                if (stream->endpoint == SOURCE_RTX)
-                    sample = MIN(-sample, INT16_MAX);
-#endif
+                if (stream->endpoint == SOURCE_RTX
+                    && ctx->sampleRate == 24000) {
+                    sample = c62_rx_baseband_sample(&stream->rx_baseband,
+                                                    sample);
+                    sample = c62_rx_equalizer_sample(&stream->rx_equalizer,
+                                                     sample);
+                }
                 ctx->buffer[stream->half * count + filled++] = (int16_t)sample;
             }
         }

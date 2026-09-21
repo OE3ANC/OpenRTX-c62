@@ -6,151 +6,115 @@
 
 # Retevis C62
 
-This target is based on the ListenAI CSK6011B SoC.
+This proof of concept (POC) runs OpenRTX on the ListenAI CSK6011B SoC with a
+BK4819 radio IC. FM and M17 transmission have been demonstrated on hardware.
+M17 reception works with the C62 receive compensation described below.
 
-## Building
+## Development status and future work
 
-For the following commands enter shell with the ListenAI environment
+This POC was developed with heavy LLM assistance and hardware testing.
+The code and DSP choices would benefit from further human review, with room
+to simplify the implementation and optimize CPU usage, buffering and receive
+compensation.
+
+A future version should use the 48 kHz DSP firmware instead of the current
+16 kHz firmware. This would remove downsampling from the 48 kHz M17 TX path
+and provide higher-rate RX input. Conversion to the modem's 24 kHz RX rate
+and Codec2's 8 kHz speech rate would still be needed. Audio transport and RX
+compensation will need to be adapted and validated again.
+
+## Build and flash
+
+Run commands from the repository root in the ListenAI Lisa environment:
 
 ```bash
 lisa zep exec bash
-````
+west build -b c62 -d build .
+```
 
-The C62 is a Zephyr target. It is built via `west` but wrapped through `meson` for convenience:
+Use `west build -p always -b c62 -d build .` for a clean build, including when
+moving from an older diagnostic build with cached configuration or overlays.
+The firmware image is `build/zephyr/zephyr.hex`.
+
+Alternatively, the Meson wrapper fetches the C62 modules (AF, FreeRTOS shims,
+LSF and URPC) with `west update --group-filter +c62` before building:
 
 ```bash
-rm -rf build
 meson setup build
 meson compile -C build openrtx_c62
 ```
 
-The build will automatically run `west update --group-filter +c62` to fetch
-C62-specific Zephyr modules (AF, FreeRTOS shims, LSF, URPC) before compiling.
+Use a fresh build directory when changing between direct West and Meson builds.
 
-Alternatively, using `west` directly:
-
-```bash
-west build -b c62 -d build .
-```
-
-## Flashing
-
-> **Warning:** This may brick your device! Use at your own risk!
+Flash with the appropriate serial port:
 
 ```bash
 cskburn -s /dev/ttyUSB0 -C 6 -b 115200 0x000000 build/zephyr/zephyr.hex
 ```
 
-## Audio streams
+## Audio transport
 
-The DSP audio service runs at 16 kHz. FM monitoring and software streams use
-the same stereo capture (MIC left, RTX right) and playback (speaker left,
-RTX right) transport. Each endpoint has independent buffering in application
-PSRAM. Application SRAM remains limited to 256 KiB; bank 4 belongs to the DSP.
+The DSP transport uses 16-bit PCM at 16 kHz. Input channels carry microphone
+(left) and radio (right) audio; output channels feed the speaker (left) and
+radio modulation input (right). The C62 audio bridge converts rates as needed:
 
-The stream bridge supports these conversions:
+| Path | Rate conversion |
+| --- | --- |
+| M17 RX baseband | 16 → 24 kHz |
+| M17 TX baseband | 48 → 16 kHz |
+| Codec2 microphone input | 16 → 8 kHz |
+| Codec2 speaker output | 8 → 16 kHz |
+| FM microphone and speaker paths | 16 kHz, no rate conversion |
 
-| Path | Software rate | Conversion |
-| --- | --- | --- |
-| M17 TX baseband | 48 kHz | 48 to 16 kHz, decimation by 3 |
-| M17 RX baseband | 24 kHz | 16 to 24 kHz, interpolation by 3 / decimation by 2 |
-| Codec2 microphone | 8 kHz | 16 to 8 kHz, decimation by 2 |
-| Codec2 speaker | 8 kHz | 8 to 16 kHz, interpolation by 2 |
+## M17 reception
 
-Streams may also use 16 kHz directly; conversion between 16 kHz and 24/48 kHz
-works in either direction. The FIR converters preserve history and rational
-phase between buffers, with unity overall gain. They do not replace the modem's
-RRC pulse shaping. Baseband conversion preserves DC through 3.6 kHz and rejects
-content at and above 8 kHz. The speech filter preserves frequencies through
-3 kHz and rejects content at and above 4 kHz. Coefficient generation parameters
-are documented in `audio_resampler.c`.
-
-Output synchronization consumes one software buffer half and paces the caller
-at its requested rate. Graceful stop flushes the FIR tail, pads the final DSP
-frame with silence and waits for queued playback. Termination cancels pending
-work. Capture overflow and stalled I/O fail the stream with a diagnostic;
-resampler saturation is counted and reported when the stream closes. There is
-no automatic level normalization or deviation compensation.
-
-Hardware validation must check continuous audio, RX decoding and transmitted
-signal quality before claiming M17 support.
-
-## BK4819 FM and M17 modes
-
-Selecting M17 applies a flat baseband profile derived from the register behavior
-reported by [Rob Riggs, WX9O, Mobilinkd](https://github.com/egzumer/uv-k5-firmware-custom/pull/583).
-RX still uses FM demodulation. Speech filters, emphasis, DC filters, microphone
-AGC, the audio limiter, companding, VOX and tone generators are disabled. M17
-uses a 12.5 kHz channel with the digital narrow RF filter configuration,
-regardless of the saved FM bandwidth. RF AGC is enabled on RX and fixed on TX.
-Software M17 decoding controls squelch; analog tone settings are ignored.
-
-The driver saves the affected FM register fields before entering M17 and
-restores them when leaving it. The current channel's FM bandwidth and squelch
-settings are then applied. Muting and unmuting AF output preserves filter
-bypass and polarity. RX/TX transitions reapply the digital profile without
-replacing the saved FM settings.
-
-The following Kconfig settings support hardware calibration:
-
-- `CONFIG_C62_M17_DEVIATION`: raw BK4819 REG_40 bits 11:0, default `0x04d2`.
-  Bit 12 is the modulation enable and is always set separately by the driver.
-  This retains the existing C62 starting value, with fixed microphone gain;
-  it is **not a calibrated RF deviation in Hz**. Mobilinkd's UV-K6/TNC4 values
-  must not be copied without calibrating the C62 DSP-to-radio path.
-- `CONFIG_C62_TX_BASEBAND_LEVEL_PERCENT`: scales MCU-to-radio PCM before
-  resampling, without affecting FM bypass or speaker audio. The Kconfig
-  default is 100%; `zephyr.conf` selects **50% (-6.02 dB)**. Hardware feedback
-  confirmed improved outer-symbol separation at this level. Absolute RF
-  deviation still requires calibration.
-- `CONFIG_C62_TX_BASEBAND_INVERT`: reverses TX baseband polarity, equivalent
-  to Module17's TX phase inversion. Enabled in `zephyr.conf` with 50% drive;
-  this combination produced decodable M17 TX. Set it to `n` for normal polarity.
-  This affects MCU-to-radio streams only, not RX, FM bypass or speaker audio.
-- `CONFIG_C62_RX_BASEBAND_INVERT`: reverses received baseband after resampling,
-  equivalent to Module17's RX phase inversion. Disabled in `zephyr.conf` for
-  the current normal-polarity RX comparison. Microphone audio, FM bypass and
-  the working TX path are unchanged.
-- `CONFIG_C62_M17_RX_GAIN1`: BK4819 RX audio attenuation in 6 dB steps
-  (0 through 3). The current RX diagnostic selects 1 (-6 dB) before the DSP
-  ADC. FM restores its original gain, and TX modulation gain is unchanged.
-- `CONFIG_C62_RX_LEVEL_DIAGNOSTICS`: enabled for the current RX diagnostic.
-  Logs `RX PCM min=... max=... mean=... near_rail=.../16000` once per second
-  during software RX capture, before resampling and polarity inversion.
-  Compare idle and received-signal levels. Near-rail counts indicate possible
-  PCM saturation; zero counts do not rule out analog distortion upstream.
-- `CONFIG_C62_MIC_BIAS_SETTLE_MS`: startup settling delay, default 250 ms.
-  Only the microphone ADC is enabled during this delay, with RX DSP and the
-  external PAs off. Mobilinkd measured 250 ms with 1 uF input coupling; verify
-  the appropriate delay for C62. There is no additional settling delay at PTT.
-
-Set overrides in `platform/mcu/CSK6011B/zephyr.conf`. When changing board
-Kconfig definitions, refresh the generated board copy using:
-
-```bash
-# Inside lisa zep exec bash
-west build -b c62 -d build . --cmake
+```text
+RF → BK4819 → DSP, 16 kHz → resampler, 24 kHz
+   → LF compensation → 81-tap equalizer → M17 decoder
+   → Codec2, 8 kHz → resampler, 16 kHz → speaker
 ```
 
-Before claiming on-air M17 operation, measure TX deviation and startup drift,
-check RX/TX polarity and the analog coupling response, verify RX decoding,
-and exercise repeated PTT and FM/M17 switches. The firmware preserves the
-existing C62 RX polarity; UV-K6 hardware modifications and polarity settings
-are not assumed to apply to C62. Absolute deviation and RX decoding remain
-unvalidated.
+RX uses normal polarity, AF9, REG_47 bit 1 set, and RX gain2 `0x3f`.
+RX gain1 provides -6 dB attenuation. Speech filters, emphasis and DC filters
+are bypassed; RF AGC stays enabled with the M17 12.5 kHz channel setting.
 
-Hardware feedback confirmed M17 TX decoding with 50% baseband drive and TX
-inversion enabled. RX inversion is now disabled for comparison after the
-capture timing fix.
+[`rx_baseband.h`](rx_baseband.h) and [`rx_equalizer.h`](rx_equalizer.h) apply
+separate, fixed compensation stages before the shared M17 decoder. They improve
+RX decoding, but the source of the underlying response distortion remains
+unidentified. These filters apply only to M17 reception.
 
-### Capture startup timing
+## M17 transmission
 
-On the ListenAI newlib toolchain, `Input endpoint 1: -139` means `EOVERFLOW`
-(RX capture queue overrun), not a bad RF level. The queue holds 160 ms at
-16 kHz. BK4819 serial transfers use `delayUs()`; this must use `k_busy_wait()`
-because `k_usleep(1)` rounds up to scheduler ticks (100 us with the C62
-configuration). Sleeping on every serial clock edge can fill the capture
-queue during receiver configuration before the modem consumes samples.
-Millisecond delays still sleep normally. Overrun diagnostics report queued,
-incoming and capacity sample counts; an overrun still fails the stream rather
-than silently dropping samples and presenting a discontinuous modem waveform.
+```text
+Microphone → DSP, 16 kHz → resampler, 8 kHz → Codec2
+   → M17 modulator, 48 kHz → 50% level and polarity inversion
+   → resampler, 16 kHz → DAC → BK4819 → RF
+```
+
+The current 50% drive and inverted polarity produce decodable M17 TX.
+The BK4819 bypasses speech processing and uses fixed gain. Its deviation field
+is `0x04d2`; absolute RF deviation still requires calibration. RX compensation
+is not applied to TX. PTT controls transmission and returns to RX on release.
+
+## FM and mode changes
+
+FM routes microphone and radio audio through the 16 kHz transport without the
+M17 codec or compensation. The driver saves FM register settings on entering
+M17 and restores them on return. Hardware squelch stays open in all modes;
+OpenRTX handles squelch and audio gating in software.
+
+## Calibration
+
+Options are declared in [`Kconfig.board`](Kconfig.board), with overrides in
+[`zephyr.conf`](../../mcu/CSK6011B/zephyr.conf):
+
+| Setting | Current value |
+| --- | --- |
+| `C62_M17_DEVIATION` | `0x04d2` (register field, not Hz) |
+| `C62_TX_BASEBAND_LEVEL_PERCENT` | `50` |
+| `C62_TX_BASEBAND_INVERT` | `y` |
+| `C62_M17_RX_GAIN1` | `1` (-6 dB) |
+| `C62_MIC_BIAS_SETTLE_MS` | `250` ms at startup |
+
+After configuration changes, run `west build -b c62 -d build . --cmake`
+inside Lisa.
