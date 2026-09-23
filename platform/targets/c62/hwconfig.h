@@ -56,6 +56,9 @@ extern const struct pwm_dt_spec pwm_lcd_backlight;
 extern const struct pwm_dt_spec pwm_rf_apc;
 extern const struct device *adc_dev;
 
+/** Restore console pins and UART settings around DSP audio initialization. */
+void c62_restore_console(void);
+
 #ifdef __cplusplus
 }
 #endif

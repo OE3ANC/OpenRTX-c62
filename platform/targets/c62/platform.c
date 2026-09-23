@@ -12,6 +12,7 @@
 #include <zephyr/drivers/adc.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/drivers/uart.h>
+#include <zephyr/drivers/pinctrl.h>
 #include <zephyr/kernel.h>
 #include <interfaces/audio.h>
 
@@ -39,6 +40,28 @@ struct adc_sequence sequence = {
     .buffer_size = sizeof(adc_raw_buffer),
     .resolution = 11, // 11-bit resolution
 };
+
+/* CP can reprogram shared pinmux and UART registers during audio setup.
+ * Reassert the board console configuration without changing IRQ ownership. */
+PINCTRL_DT_DEFINE(DT_CHOSEN(zephyr_console));
+
+void c62_restore_console(void)
+{
+    const struct device *console = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+    const struct uart_config config = {
+        .baudrate = DT_PROP(DT_CHOSEN(zephyr_console), current_speed),
+        .parity = UART_CFG_PARITY_NONE,
+        .stop_bits = UART_CFG_STOP_BITS_1,
+        .data_bits = UART_CFG_DATA_BITS_8,
+        .flow_ctrl = UART_CFG_FLOW_CTRL_NONE,
+    };
+    int pins = pinctrl_apply_state(
+        PINCTRL_DT_DEV_CONFIG_GET(DT_CHOSEN(zephyr_console)),
+        PINCTRL_STATE_DEFAULT);
+    int uart = uart_configure(console, &config);
+    if (pins != 0 || uart != 0)
+        printk("Console configuration failed: pins=%d uart=%d\n", pins, uart);
+}
 
 static int battery_init(void);
 
