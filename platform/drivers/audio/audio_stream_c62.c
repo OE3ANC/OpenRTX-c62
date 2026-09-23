@@ -23,7 +23,8 @@ LOG_MODULE_REGISTER(c62_audio_stream, LOG_LEVEL_INF);
 /* Request an explicit 10 ms capture frame. */
 #define CAPTURE_FRAME_SAMPLES (DSP_SAMPLE_RATE / 100)
 #define RECORD_CHANNELS (CHANNEL_IN_LEFT | CHANNEL_IN_RIGHT)
-/* Capacity for 160 ms at the DSP rate, stored in application PSRAM. */
+/* Storage for 160 ms at 48 kHz. Input uses QUEUE_SAMPLES / rate_divisor
+ * entries to retain the same time budget at the application sample rate. */
 #define QUEUE_SAMPLES (DSP_SAMPLE_RATE * 160 / 1000)
 #define IO_TIMEOUT_MS 1000
 #define AUDIO_STACK_SIZE (8 * 1024)
@@ -145,20 +146,22 @@ static void capture_frame(void)
     size_t count = record.mCblk->frameCount;
     for (unsigned int source = 0; source < 2; source++) {
         struct audio_stream *stream = &inputs[source];
-        if (stream->ctx != NULL && stream->ctx->running
-            && count > QUEUE_SAMPLES - stream->queue.count) {
-            LOG_ERR("Capture overrun on endpoint %u: queued=%u frame=%u "
-                    "capacity=%u",
-                    source, (unsigned int)stream->queue.count,
-                    (unsigned int)count, QUEUE_SAMPLES);
-            stream_fail(stream, -EOVERFLOW);
-        }
-
         for (size_t i = 0; i < count; i++) {
             int16_t sample =
                 samples[i * channels + record.mChannelOutIdx[source]];
             if (stream->ctx != NULL && stream->ctx->running) {
-                queue_push(&stream->queue, sample);
+                /* Keep every Nth sample before queueing. Phase belongs to
+                 * capture and continues across DSP and application blocks. */
+                if (stream->capture_phase == 0) {
+                    if (stream->queue.count
+                        == QUEUE_SAMPLES / stream->rate_divisor)
+                        stream_fail(stream, -EOVERFLOW);
+                    else
+                        queue_push(&stream->queue, sample);
+                }
+                stream->capture_phase++;
+                if (stream->capture_phase == stream->rate_divisor)
+                    stream->capture_phase = 0;
             }
             for (unsigned int sink = 0; sink < 2; sink++) {
                 if (!paths[source][sink])
@@ -354,15 +357,9 @@ static int capture_samples(struct audio_stream *stream, struct streamCtx *ctx,
             k_mutex_unlock(&audio_mutex);
             return -EIO;
         }
-        /* Keep every Nth sample, retaining phase across caller buffers. */
-        while (filled < count && stream->queue.count != 0) {
-            int16_t sample = queue_pop(&stream->queue);
-            if (stream->capture_phase == 0)
-                ctx->buffer[stream->half * count + filled++] = sample;
-            stream->capture_phase++;
-            if (stream->capture_phase == stream->rate_divisor)
-                stream->capture_phase = 0;
-        }
+        while (filled < count && stream->queue.count != 0)
+            ctx->buffer[stream->half * count + filled++] =
+                queue_pop(&stream->queue);
         k_mutex_unlock(&audio_mutex);
         if (filled == count)
             return 0;
