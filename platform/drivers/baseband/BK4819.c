@@ -133,6 +133,7 @@ void bk4819_init(const struct BK4819 *dev)
     BK4819_writeReg(dev, 0x28, 0x6b38);
     BK4819_writeReg(dev, 0x29, 0xb4cb);
     BK4819_writeReg(dev, BK4819_REG_36, 0xdfbf);
+    BK4819_writeReg(dev, BK4819_REG_47, 0x6040);
 }
 
 uint8_t bk4819_int_get(const struct BK4819 *dev, bk4819_int_t interrupt)
@@ -293,9 +294,15 @@ void bk4819_set_Squelch(const struct BK4819 *dev, uint8_t RTSO, uint8_t RTSC,
                         uint8_t ETSO, uint8_t ETSC, uint8_t GTSO, uint8_t GTSC)
 {
     BK4819_writeReg(dev, BK4819_REG_78, (RTSO << 8) | RTSC);
-    BK4819_writeReg(dev, BK4819_REG_4F, (ETSC << 8) | ETSO);
-    BK4819_writeReg(dev, BK4819_REG_4D, GTSC);
-    BK4819_writeReg(dev, BK4819_REG_4E, GTSO);
+
+    // Only change threshold fields; preserve timing and reserved bits.
+    uint16_t value = BK4819_readReg(dev, BK4819_REG_4F);
+    BK4819_writeReg(dev, BK4819_REG_4F,
+                    (value & 0x8080) | ((ETSC & 0x7f) << 8) | (ETSO & 0x7f));
+    value = BK4819_readReg(dev, BK4819_REG_4D);
+    BK4819_writeReg(dev, BK4819_REG_4D, (value & 0xff00) | GTSC);
+    value = BK4819_readReg(dev, BK4819_REG_4E);
+    BK4819_writeReg(dev, BK4819_REG_4E, (value & 0xff00) | GTSO);
 }
 
 int16_t bk4819_get_rssi(const struct BK4819 *dev)
@@ -337,8 +344,10 @@ uint32_t bk4819_get_scan_freq(const struct BK4819 *dev)
 
 void BK4819_SetAF(const struct BK4819 *dev, uint8_t AF)
 {
-    /* AF Output Inverse Mode = Inverse, undocumented bits 0x2040 */
-    BK4819_writeReg(dev, BK4819_REG_47, (6u << 12) | (AF << 8) | (1u << 6));
+    /* Preserve polarity and TX filter bypass when muting/unmuting RX. */
+    uint16_t value = BK4819_readReg(dev, BK4819_REG_47);
+    BK4819_writeReg(dev, BK4819_REG_47,
+                    (value & ~0x0f00u) | ((AF & 0x0fu) << 8));
 }
 
 __inline uint16_t scale_freq(const uint16_t freq)

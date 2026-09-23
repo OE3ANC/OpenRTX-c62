@@ -373,6 +373,9 @@ static int play_samples(struct audio_stream *stream, struct streamCtx *ctx,
                 if (consumed == count)
                     break;
                 int32_t sample = samples[consumed++];
+                /* C62 radio drive: 50% amplitude and inverted polarity. */
+                if (stream->endpoint == SINK_RTX)
+                    sample = -(sample / 2);
                 stream->playback_sample = (int16_t)sample;
                 stream->playback_repeats = stream->rate_divisor;
             }

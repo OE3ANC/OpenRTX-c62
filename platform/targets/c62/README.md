@@ -1,42 +1,35 @@
 <!--
- - SPDX-FileCopyrightText: Copyright 2020-2026 OpenRTX Contributors
- -
- - SPDX-License-Identifier: GPL-3.0-or-later
+SPDX-FileCopyrightText: Copyright 2020-2026 OpenRTX Contributors
+SPDX-License-Identifier: GPL-3.0-or-later
 -->
-
 # Retevis C62
 
-This target is based on the ListenAI CSK6011B SoC.
+## Build
 
-## Building
+The matching DSP firmware is bundled in `resources/dsp_firmware.bin`, from
+ListenAI SDK commit `2ac605527dcde3e90c814bb4175546cc7fbd36da`.
+The build verifies and copies it to `build/zephyr/dsp_firmware.bin`.
 
-For the following commands enter shell with the ListenAI environment
+Enter the ListenAI SDK environment, fetch the C62 dependencies from OpenRTX, and
+build from the repository root:
 
-```bash
+```sh
 lisa zep exec bash
-````
-
-The C62 is a Zephyr target. It is built via `west` but wrapped through `meson` for convenience:
-
-```bash
-rm -rf build
-meson setup build
-meson compile -C build openrtx_c62
+west update openrtx-c62-modules-af openrtx-c62-modules-freertos_shims \
+  openrtx-c62-modules-lsf openrtx-c62-modules-urpc
+west build -p always -b c62 -d build .
 ```
 
-The build will automatically run `west update --group-filter +c62` to fetch
-C62-specific Zephyr modules (AF, FreeRTOS shims, LSF, URPC) before compiling.
+For subsequent builds, use `west build -d build`.
 
-Alternatively, using `west` directly:
+## Flash
 
-```bash
-west build -b c62 -d build .
+Close the serial monitor and flash both matching images:
+
+```sh
+cskburn -s /dev/ttyUSB0 -C 6 -b 115200 \
+  0x000000 build/zephyr/zephyr.bin \
+  0x100000 build/zephyr/dsp_firmware.bin
 ```
 
-## Flashing
-
-> **Warning:** This may brick your device! Use at your own risk!
-
-```bash
-cskburn -s /dev/ttyUSB0 -C 6 -b 115200 0x000000 build/zephyr/zephyr.hex
-```
+UART2 console output uses 115200 baud.

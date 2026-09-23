@@ -10,7 +10,10 @@
 
 void delayUs(unsigned int useconds)
 {
-    k_usleep(useconds);
+    /* Serial bit-banging needs microsecond timing. k_usleep() rounds up to
+     * scheduler ticks (100 us on C62), stalling RX setup until capture fills.
+     */
+    k_busy_wait(useconds);
 }
 
 void delayMs(unsigned int mseconds)
