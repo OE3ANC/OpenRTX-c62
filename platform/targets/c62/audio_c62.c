@@ -4,667 +4,818 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-#include <zephyr/logging/log.h>
+#include <errno.h>
+#include <csk6_cm33/include/cache.h>
+#include <csk6_cm33/include/venus_ap.h>
+#include <stdio.h>
+#include <string.h>
 #include <zephyr/kernel.h>
-#include <zephyr/devicetree.h>
 #include <zephyr/drivers/gpio.h>
-#include <zephyr/device.h>
+#include <zephyr/drivers/pinctrl.h>
+#include <zephyr/drivers/uart.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/sys/sys_io.h>
+#include <interfaces/audio.h>
+#include <hwconfig.h>
+#include <interfaces/radio.h>
 #include "AudioSystem.h"
 #include "AudioTrack.h"
 #include "AudioRecord.h"
-#include <assert.h>
-#include <math.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <interfaces/audio.h>
-#include <hwconfig.h>
 
-#define SAMPLE_RATE (16000) // Sample rate in Hz
+LOG_MODULE_REGISTER(c62_audio, LOG_LEVEL_INF);
 
-// Live audio streaming configuration
-#define AUDIO_CHUNK_MS (20) // 20ms chunks for low latency
-#define AUDIO_CHUNK_SAMPLES (SAMPLE_RATE * AUDIO_CHUNK_MS / 1000)
-#define AUDIO_CHUNK_SIZE (AUDIO_CHUNK_SAMPLES * sizeof(int16_t))
-#define AUDIO_BUFFER_CHUNKS (8) // Circular buffer with multiple chunks
-#define AUDIO_THREAD_STACK_SIZE (8 * 1024)
-#define AUDIO_THREAD_PRIORITY (5)
+#define DSP_SAMPLE_RATE 48000
+/* Request an explicit 10 ms capture frame. */
+#define CAPTURE_FRAME_SAMPLES (DSP_SAMPLE_RATE / 100)
+#define RECORD_CHANNELS (CHANNEL_IN_LEFT | CHANNEL_IN_RIGHT)
+/* Capacity for 160 ms at the DSP rate, stored in application PSRAM. */
+#define QUEUE_SAMPLES (DSP_SAMPLE_RATE * 160 / 1000)
+#define IO_TIMEOUT_MS 1000
+#define AUDIO_STACK_SIZE (8 * 1024)
 
-#define PATH(x, y) ((x << 4) | y)
+struct sample_queue {
+    int16_t samples[QUEUE_SAMPLES];
+    size_t head;
+    size_t count;
+};
 
-// Circular buffer for audio data exchange between threads
-typedef struct {
-    uint8_t buffer[AUDIO_CHUNK_SIZE];
-    bool filled;
-} AudioChunk;
+struct audio_stream {
+    struct streamCtx *ctx;
+    struct sample_queue queue;
+    struct k_sem wake;
+    bool input;
+    bool busy;
+    unsigned int endpoint;
+    unsigned int half;
+    unsigned int data_half;
+    int error;
+    unsigned int rate_divisor;
+    unsigned int capture_phase;
+    int16_t playback_sample;
+    unsigned int playback_repeats;
+    int64_t play_until;
+    uint32_t clock_fraction;
+};
 
-typedef struct {
-    AudioChunk chunks[AUDIO_BUFFER_CHUNKS];
-    int write_idx;
-    int read_idx;
-    struct k_mutex mutex;
-    struct k_sem data_ready;
-    struct k_sem space_available;
-} AudioRingBuffer;
+static K_MUTEX_DEFINE(audio_mutex);
+static bool initialized;
+static bool terminating;
+static bool worker_running;
+static bool paths[3][3];
+static bool record_active;
+static bool output_active[2];
+static AudioRecord record;
+static AudioTrack playback_track;
+static bool playback_active;
+static struct k_thread worker;
+K_THREAD_STACK_DEFINE(worker_stack, AUDIO_STACK_SIZE);
 
-#define C62_AUDIO_CHANNEL_MIC CHANNEL_IN_LEFT
-#define C62_AUDIO_CHANNEL_RX CHANNEL_IN_RIGHT
-#define C62_AUDIO_CHANNEL_SPK CHANNEL_OUT_FRONT_LEFT
-#define C62_AUDIO_CHANNEL_TX CHANNEL_OUT_FRONT_RIGHT
+/* Separate queues prevent MIC/RX and speaker/TX from stealing each other's data. */
+static struct audio_stream inputs[2] __attribute__((section(".psram_section")));
+static struct audio_stream outputs[2]
+    __attribute__((section(".psram_section")));
+static struct sample_queue bypass[2] __attribute__((section(".psram_section")));
 
-#define AUDIO_INPUT_CHANNEL_COUNT 2
+static const bool input_config = true;
+static const bool output_config = false;
 
-// Live audio streaming state
-typedef struct {
-    enum AudioSource source;
-    enum AudioSink sink;
-    bool active;
-} AudioPath;
+static void queue_reset(struct sample_queue *queue)
+{
+    queue->head = queue->count = 0;
+}
 
-static AudioPath s_active_paths[3]; // Support up to 3 simultaneous paths
-static int s_active_path_count = 0;
-static struct k_mutex s_audio_mutex;
+static int16_t queue_pop(struct sample_queue *queue)
+{
+    int16_t sample = queue->samples[queue->head];
+    queue->head = (queue->head + 1) % QUEUE_SAMPLES;
+    queue->count--;
+    return sample;
+}
 
-// Audio devices for each source/sink
-static AudioRecord s_record;
-static AudioTrack s_track_spk;
-static AudioTrack s_track_rtx_output;
+static void queue_push(struct sample_queue *queue, int16_t sample)
+{
+    size_t tail = (queue->head + queue->count) % QUEUE_SAMPLES;
+    queue->samples[tail] = sample;
+    queue->count++;
+}
 
-static bool s_audio_initialized = false;
-static bool s_audio_streaming = false;
+/* All helpers accessing streams or vendor objects run under audio_mutex. */
+static void stream_fail(struct audio_stream *stream, int error)
+{
+    if (stream->error == 0)
+        LOG_ERR("%s endpoint %u: %d", stream->input ? "Input" : "Output",
+                stream->endpoint, error);
+    stream->error = error;
+    if (stream->ctx != NULL)
+        stream->ctx->running = 0;
+    k_sem_give(&stream->wake);
+}
 
-// Track which devices are currently active
-static bool s_mic_active = false;
-static bool s_rtx_input_active = false;
-static bool s_spk_active = false;
-static bool s_rtx_output_active = false;
+static bool stream_valid(struct audio_stream *stream, struct streamCtx *ctx)
+{
+    return stream->ctx == ctx && ctx->running && stream->error == 0;
+}
+
+static void stream_detach(struct audio_stream *stream)
+{
+    if (stream->ctx != NULL)
+        stream->ctx->running = 0;
+    stream->ctx = NULL;
+    queue_reset(&stream->queue);
+    k_sem_give(&stream->wake);
+}
+
+/*
+ * AudioRecord_read() waits indefinitely and copies whole DSP frames even when
+ * the requested size is smaller. Use the same ICStream transport nonblocking,
+ * consuming its actual frame size and AudioRecord's channel mapping instead.
+ */
+static void capture_frame(void)
+{
+    ICStream *ic = record.mICStream;
+    ICStream_Consumer_fetchRemote(ic);
+    if (ICStream_Consumer_isEmpty(ic))
+        return;
+
+    void *frame;
+    int ret = ICStream_Consumer_acquireFrame(ic, &frame);
+    if (ret != IC_OK)
+        goto error;
+
+    const int16_t *samples = frame;
+    size_t channels = ic->share->channelCount;
+    size_t count = record.mCblk->frameCount;
+    for (unsigned int source = 0; source < 2; source++) {
+        struct audio_stream *stream = &inputs[source];
+        if (stream->ctx != NULL && stream->ctx->running
+            && count > QUEUE_SAMPLES - stream->queue.count) {
+            LOG_ERR("Capture overrun on endpoint %u: queued=%u frame=%u "
+                    "capacity=%u",
+                    source, (unsigned int)stream->queue.count,
+                    (unsigned int)count, QUEUE_SAMPLES);
+            stream_fail(stream, -EOVERFLOW);
+        }
+
+        for (size_t i = 0; i < count; i++) {
+            int16_t sample =
+                samples[i * channels + record.mChannelOutIdx[source]];
+            if (stream->ctx != NULL && stream->ctx->running) {
+                queue_push(&stream->queue, sample);
+            }
+            for (unsigned int sink = 0; sink < 2; sink++) {
+                if (!paths[source][sink])
+                    continue;
+                if (bypass[sink].count == QUEUE_SAMPLES)
+                    queue_pop(&bypass[sink]);
+                queue_push(&bypass[sink], sample);
+            }
+        }
+        k_sem_give(&stream->wake);
+    }
+
+    ret = ICStream_Consumer_releaseFrame(ic, frame);
+    if (ret == IC_OK)
+        ret = ICStream_Consumer_commitRemote(ic);
+    if (ret == IC_OK)
+        return;
+error:
+    for (unsigned int i = 0; i < 2; i++) {
+        if (inputs[i].ctx != NULL)
+            stream_fail(&inputs[i], -EIO);
+    }
+}
+
+/* One DSP playback stream carries both physical outputs, L=speaker/R=RF.
+ * Only this worker consumes output queues or writes the shared AudioTrack. */
+static void play_queued_audio(void)
+{
+    if (!playback_active)
+        return;
+    bool pending = false;
+    for (unsigned int sink = 0; sink < 2; sink++)
+        pending |= output_active[sink]
+                && (outputs[sink].queue.count || bypass[sink].count);
+    if (!pending)
+        return;
+
+    /* Submit complete DSP frames, including a zero-padded final tail. */
+    AudioTrack_Buffer buffer = {
+        .frameCount = playback_track.mICStream->share->sampleCountPerFrame
+    };
+    if (AudioTrack_obtainBuffer(&playback_track, &buffer, 0) != 0)
+        return;
+    for (size_t i = 0; i < buffer.frameCount; i++) {
+        for (unsigned int sink = 0; sink < 2; sink++) {
+            int32_t sample = 0;
+            if (output_active[sink]) {
+                if (outputs[sink].queue.count)
+                    sample += queue_pop(&outputs[sink].queue);
+                if (bypass[sink].count)
+                    sample += queue_pop(&bypass[sink]);
+            }
+            buffer.i16[2 * i + sink] = CLAMP(sample, INT16_MIN, INT16_MAX);
+        }
+    }
+    AudioTrack_releaseBuffer(&playback_track, &buffer);
+    for (unsigned int sink = 0; sink < 2; sink++)
+        k_sem_give(&outputs[sink].wake);
+}
+
+/* Update both outputs together to avoid stopping the shared track when
+ * routing moves from one output to the other. */
+static void set_playback_active(bool speaker, bool radio)
+{
+    output_active[SINK_SPK] = speaker;
+    output_active[SINK_RTX] = radio;
+    bool active = speaker || radio;
+    if (active != playback_active) {
+        if (active) {
+            AudioTrack_start(&playback_track);
+        } else {
+            AudioTrack_stop(&playback_track);
+            AudioTrack_flush(&playback_track);
+        }
+        playback_active = active;
+    }
+}
+
+static void audio_worker(void *arg1, void *arg2, void *arg3)
+{
+    (void)arg1;
+    (void)arg2;
+    (void)arg3;
+    for (;;) {
+        k_mutex_lock(&audio_mutex, K_FOREVER);
+        if (!worker_running) {
+            k_mutex_unlock(&audio_mutex);
+            return;
+        }
+        if (record_active)
+            capture_frame();
+        play_queued_audio();
+        k_mutex_unlock(&audio_mutex);
+        k_sleep(K_MSEC(1));
+    }
+}
+
+static int stream_start(const uint8_t instance, const void *config,
+                        struct streamCtx *ctx)
+{
+    if (instance >= 2 || ctx->buffer == NULL || ctx->bufSize == 0
+        || (ctx->bufMode != BUF_LINEAR && ctx->bufMode != BUF_CIRC_DOUBLE)
+        || (ctx->bufMode == BUF_CIRC_DOUBLE && ctx->bufSize % 2 != 0))
+        return -EINVAL;
+
+    bool input = *(const bool *)config;
+    struct audio_stream *stream = input ? &inputs[instance] :
+                                          &outputs[instance];
+    k_mutex_lock(&audio_mutex, K_FOREVER);
+    int ret = 0;
+    if (!initialized
+        || !(input ? paths[instance][SINK_MCU] : paths[SOURCE_MCU][instance])) {
+        ret = -ENODEV;
+    } else if (stream->busy || (stream->ctx != NULL && stream->ctx != ctx)) {
+        ret = -EBUSY;
+    } else if (stream->ctx == ctx && ctx->bufMode == BUF_LINEAR) {
+        /* Re-arm linear capture without resetting the sample-selection phase. */
+        ctx->running = stream->error == 0;
+        ret = stream->error;
+    } else if (ctx->sampleRate != 8000 && ctx->sampleRate != 16000
+               && ctx->sampleRate != 24000
+               && ctx->sampleRate != DSP_SAMPLE_RATE) {
+        ret = -EINVAL;
+    } else {
+        stream->ctx = ctx;
+        stream->half = stream->data_half = 0;
+        stream->error = 0;
+        stream->rate_divisor = DSP_SAMPLE_RATE / ctx->sampleRate;
+        stream->capture_phase = 0;
+        stream->playback_repeats = 0;
+        stream->play_until = 0;
+        stream->clock_fraction = 0;
+        queue_reset(&stream->queue);
+        k_sem_reset(&stream->wake);
+        ctx->priv = stream;
+        ctx->running = 1;
+        if (!input && !output_active[instance]) {
+            set_playback_active(output_active[SINK_SPK] || instance == SINK_SPK,
+                                output_active[SINK_RTX]
+                                    || instance == SINK_RTX);
+        }
+    }
+    k_mutex_unlock(&audio_mutex);
+    return ret;
+}
+
+static int stream_data(struct streamCtx *ctx, stream_sample_t **buffer)
+{
+    struct audio_stream *stream = ctx->priv;
+    int count = -EIO;
+    *buffer = NULL;
+    k_mutex_lock(&audio_mutex, K_FOREVER);
+    if (stream != NULL && stream->ctx == ctx && stream->error == 0) {
+        count = ctx->bufSize / (ctx->bufMode == BUF_CIRC_DOUBLE ? 2 : 1);
+        *buffer = ctx->buffer + count * stream->data_half;
+    }
+    k_mutex_unlock(&audio_mutex);
+    return count;
+}
+
+static int capture_samples(struct audio_stream *stream, struct streamCtx *ctx,
+                           size_t count)
+{
+    size_t filled = 0;
+    int64_t deadline = k_uptime_get() + IO_TIMEOUT_MS;
+    while (filled < count) {
+        k_mutex_lock(&audio_mutex, K_FOREVER);
+        if (!stream_valid(stream, ctx)) {
+            k_mutex_unlock(&audio_mutex);
+            return -EIO;
+        }
+        /* Keep every Nth sample, retaining phase across caller buffers. */
+        while (filled < count && stream->queue.count != 0) {
+            int16_t sample = queue_pop(&stream->queue);
+            if (stream->capture_phase == 0)
+                ctx->buffer[stream->half * count + filled++] = sample;
+            stream->capture_phase++;
+            if (stream->capture_phase == stream->rate_divisor)
+                stream->capture_phase = 0;
+        }
+        k_mutex_unlock(&audio_mutex);
+        if (filled == count)
+            return 0;
+        if (k_uptime_get() >= deadline)
+            return -ETIMEDOUT;
+        k_sem_take(&stream->wake, K_MSEC(10));
+    }
+    return 0;
+}
+
+/* Enqueue a caller-owned block, with bounded waits and cancellation checks. */
+static int play_samples(struct audio_stream *stream, struct streamCtx *ctx,
+                        const int16_t *samples, size_t count)
+{
+    size_t consumed = 0;
+    int64_t deadline = k_uptime_get() + IO_TIMEOUT_MS;
+    for (;;) {
+        k_mutex_lock(&audio_mutex, K_FOREVER);
+        if (!stream_valid(stream, ctx)) {
+            k_mutex_unlock(&audio_mutex);
+            return -EIO;
+        }
+        if (consumed == count && stream->playback_repeats == 0) {
+            k_mutex_unlock(&audio_mutex);
+            return 0;
+        }
+        size_t written = 0;
+        while (stream->queue.count < QUEUE_SAMPLES) {
+            if (stream->playback_repeats == 0) {
+                if (consumed == count)
+                    break;
+                int32_t sample = samples[consumed++];
+                stream->playback_sample = (int16_t)sample;
+                stream->playback_repeats = stream->rate_divisor;
+            }
+            /* Repeat samples without interpolation or filtering. */
+            queue_push(&stream->queue, stream->playback_sample);
+            stream->playback_repeats--;
+            written++;
+        }
+        k_mutex_unlock(&audio_mutex);
+        if (written != 0)
+            deadline = k_uptime_get() + IO_TIMEOUT_MS;
+        else if (k_uptime_get() >= deadline)
+            return -ETIMEDOUT;
+        if (written == 0)
+            k_sem_take(&stream->wake, K_MSEC(1));
+    }
+}
+
+static int wait_playback(struct audio_stream *stream, struct streamCtx *ctx,
+                         int64_t until)
+{
+    for (;;) {
+        k_mutex_lock(&audio_mutex, K_FOREVER);
+        bool valid = stream_valid(stream, ctx);
+        k_mutex_unlock(&audio_mutex);
+        if (!valid)
+            return -EIO;
+        int64_t remaining = until - k_uptime_get();
+        if (remaining <= 0)
+            return 0;
+        k_sem_take(&stream->wake, K_MSEC(MIN(remaining, 10)));
+    }
+}
+
+static int stream_sync(struct streamCtx *ctx, uint8_t dirty)
+{
+    (void)dirty;
+    struct audio_stream *stream = ctx->priv;
+    k_mutex_lock(&audio_mutex, K_FOREVER);
+    if (stream == NULL || !stream_valid(stream, ctx) || stream->busy) {
+        k_mutex_unlock(&audio_mutex);
+        return -1;
+    }
+    stream->busy = true;
+    size_t count = ctx->bufSize / (ctx->bufMode == BUF_CIRC_DOUBLE ? 2 : 1);
+    unsigned int half = stream->half;
+    /* Anchor to the sample clock, not to when the producer finishes its work. */
+    uint64_t duration = (uint64_t)count * 1000 + stream->clock_fraction;
+    int64_t until = stream->play_until != 0 ? stream->play_until :
+                                              k_uptime_get();
+    until += duration / ctx->sampleRate;
+    k_mutex_unlock(&audio_mutex);
+
+    int ret;
+    if (stream->input) {
+        ret = capture_samples(stream, ctx, count);
+    } else {
+        /* sync(false) plays the existing half, as a DMA-backed driver would. */
+        ret = play_samples(stream, ctx, ctx->buffer + half * count, count);
+        if (ret == 0)
+            ret = wait_playback(stream, ctx, until);
+    }
+
+    k_mutex_lock(&audio_mutex, K_FOREVER);
+    if (stream->ctx == ctx) {
+        if (ret == 0) {
+            stream->data_half = half;
+            if (ctx->bufMode == BUF_CIRC_DOUBLE)
+                stream->half ^= 1;
+            else
+                ctx->running = 0;
+            if (!stream->input) {
+                stream->data_half = stream->half;
+                stream->play_until = until;
+                stream->clock_fraction = duration % ctx->sampleRate;
+            }
+        } else {
+            stream_fail(stream, ret);
+        }
+    }
+    stream->busy = false;
+    k_mutex_unlock(&audio_mutex);
+    return ret;
+}
+
+/* Drain queued samples and the final partial DSP frame before unkeying. */
+static int drain_output(struct audio_stream *stream, struct streamCtx *ctx)
+{
+    int64_t deadline = k_uptime_get() + IO_TIMEOUT_MS;
+    for (;;) {
+        k_mutex_lock(&audio_mutex, K_FOREVER);
+        if (!stream_valid(stream, ctx)) {
+            k_mutex_unlock(&audio_mutex);
+            return -EIO;
+        }
+        if (stream->queue.count == 0) {
+            ICStream_Producer_fetchRemote(playback_track.mICStream);
+            const ICStreamFifo *fifo = &playback_track.mICStream->share->fifo;
+            /* Our samples precede this snapshot of the shared DSP FIFO.
+             * Other-channel playback may continue. */
+            size_t queued_frames = (fifo->size - fifo_avail(fifo))
+                                 / (2 * sizeof(int16_t));
+            uint32_t latency = DIV_ROUND_UP(queued_frames * 1000,
+                                            DSP_SAMPLE_RATE)
+                             + playback_track.mLatency + 20;
+            k_mutex_unlock(&audio_mutex);
+            return wait_playback(stream, ctx, k_uptime_get() + latency);
+        }
+        k_mutex_unlock(&audio_mutex);
+        if (k_uptime_get() >= deadline)
+            return -ETIMEDOUT;
+        k_sem_take(&stream->wake, K_MSEC(1));
+    }
+}
+
+static void stream_terminate(struct streamCtx *ctx)
+{
+    k_mutex_lock(&audio_mutex, K_FOREVER);
+    struct audio_stream *stream = ctx->priv;
+    if (stream != NULL && stream->ctx == ctx) {
+        if (!stream->input && output_active[stream->endpoint]) {
+            unsigned int sink = stream->endpoint;
+            bool bypass_active = paths[SOURCE_MIC][sink]
+                              || paths[SOURCE_RTX][sink];
+            set_playback_active(
+                sink == SINK_SPK ? bypass_active : output_active[SINK_SPK],
+                sink == SINK_RTX ? bypass_active : output_active[SINK_RTX]);
+        }
+        stream_detach(stream);
+    }
+    k_mutex_unlock(&audio_mutex);
+}
+
+static void stream_stop(struct streamCtx *ctx)
+{
+    k_mutex_lock(&audio_mutex, K_FOREVER);
+    struct audio_stream *stream = ctx->priv;
+    /* M17 joins the speech decoder when reception ends. Draining speaker
+     * playback here blocks the RX consumer while capture keeps filling its
+     * queue. Circular speaker stop discards pending playback. RF output
+     * still drains before unkeying, as do finite linear playback blocks.
+     */
+    bool drain = stream != NULL && stream_valid(stream, ctx) && !stream->input
+              && (stream->endpoint == SINK_RTX || ctx->bufMode == BUF_LINEAR)
+              && !stream->busy;
+    if (drain)
+        stream->busy = true;
+    k_mutex_unlock(&audio_mutex);
+    if (drain) {
+        int ret = drain_output(stream, ctx);
+        k_mutex_lock(&audio_mutex, K_FOREVER);
+        if (ret != 0 && stream->ctx == ctx)
+            stream_fail(stream, ret);
+        stream->busy = false;
+        k_mutex_unlock(&audio_mutex);
+    }
+    stream_terminate(ctx);
+}
+
+static const struct audioDriver stream_driver = {
+    .start = stream_start,
+    .data = stream_data,
+    .sync = stream_sync,
+    .stop = stream_stop,
+    .terminate = stream_terminate,
+};
 
 const struct audioDevice outputDevices[] = {
-    { NULL, 0, 0, SINK_MCU },
-    { NULL, 0, 0, SINK_RTX },
-    { NULL, 0, 0, SINK_SPK },
+    { NULL, NULL, 0, SINK_MCU },
+    { &stream_driver, &output_config, SINK_RTX, SINK_RTX },
+    { &stream_driver, &output_config, SINK_SPK, SINK_SPK },
 };
 
 const struct audioDevice inputDevices[] = {
-    { NULL, 0, 0, SINK_MCU },
-    { NULL, 0, 0, SINK_RTX },
-    { NULL, 0, 0, SINK_SPK },
+    { NULL, NULL, 0, SOURCE_MCU },
+    { &stream_driver, &input_config, SOURCE_RTX, SOURCE_RTX },
+    { &stream_driver, &input_config, SOURCE_MIC, SOURCE_MIC },
 };
 
-// Ring buffer for audio data exchange (in PSRAM)
-__attribute__((section(".psram_section"))) static AudioRingBuffer s_ring_buffer;
+/* CP can reprogram shared pinmux and UART registers during audio setup.
+ * Reassert the board console configuration without changing IRQ ownership. */
+PINCTRL_DT_DEFINE(DT_CHOSEN(zephyr_console));
 
-// Separate threads for input and output
-static struct k_thread s_audio_input_thread;
-static struct k_thread s_audio_output_thread;
-K_THREAD_STACK_DEFINE(s_audio_input_stack, AUDIO_THREAD_STACK_SIZE);
-K_THREAD_STACK_DEFINE(s_audio_output_stack, AUDIO_THREAD_STACK_SIZE);
-
-#define FREQUENCY 440 // Frequency of the sine wave in Hz (A4)
-
-/* Fill buffer with sine wave data */
-static void fillSineWave(uint8_t *buffer, size_t size)
+static void audio_restore_console(void)
 {
-    // Calculate the sine wave
-    for (size_t i = 0; i < size / sizeof(int16_t); i++) {
-        // Calculate sample value
-        double sample = sin(2.0 * M_PI * FREQUENCY * (i / (double)SAMPLE_RATE));
-
-        // Scale to 16-bit PCM range (-32768 to 32767)
-        int16_t pcmValue = (int16_t)(sample * 32767);
-
-        // Store the PCM value in the buffer
-        buffer[2 * i] = (uint8_t)(pcmValue & 0xFF);            // LSB
-        buffer[2 * i + 1] = (uint8_t)((pcmValue >> 8) & 0xFF); // MSB
-    }
+    const struct device *console = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+    const struct uart_config config = {
+        .baudrate = DT_PROP(DT_CHOSEN(zephyr_console), current_speed),
+        .parity = UART_CFG_PARITY_NONE,
+        .stop_bits = UART_CFG_STOP_BITS_1,
+        .data_bits = UART_CFG_DATA_BITS_8,
+        .flow_ctrl = UART_CFG_FLOW_CTRL_NONE,
+    };
+    int pins = pinctrl_apply_state(
+        PINCTRL_DT_DEV_CONFIG_GET(DT_CHOSEN(zephyr_console)),
+        PINCTRL_STATE_DEFAULT);
+    int uart = uart_configure(console, &config);
+    if (pins != 0 || uart != 0)
+        LOG_ERR("Console configuration failed: pins=%d uart=%d", pins, uart);
 }
 
-// Ring buffer helper functions
-static void ring_buffer_init(AudioRingBuffer *rb)
+/* Refresh the shared layout after the DSP opens or reconfigures a stream. */
+static struct ICStreamShare *refresh_stream_layout(ICStream *stream)
 {
-    k_mutex_init(&rb->mutex);
-    k_sem_init(&rb->data_ready, 0, AUDIO_BUFFER_CHUNKS);
-    k_sem_init(&rb->space_available, AUDIO_BUFFER_CHUNKS, AUDIO_BUFFER_CHUNKS);
-
-    rb->write_idx = 0;
-    rb->read_idx = 0;
-
-    for (int i = 0; i < AUDIO_BUFFER_CHUNKS; i++) {
-        rb->chunks[i].filled = false;
-    }
+    struct ICStreamShare *share = stream->share;
+    dcache_invalidate_range((unsigned long)share,
+                            (unsigned long)share
+                                + IC_DCACHELINE_ROUNDUP_SIZE(sizeof(*share)));
+    __DSB();
+    ICStream_reconfig(stream);
+    return share;
 }
 
-static bool ring_buffer_write(AudioRingBuffer *rb, const uint8_t *data,
-                              size_t size)
+/* Venus HAL: ADC01 is the AON codec at 0x46e20000, not CP ADC23.
+ * R6 bit 14 controls HPF2 for both channels; bit 15 is the separate HPF1.
+ * Apply after the synchronous DSP start, which may configure the codec.
+ */
+static void disable_adc_hpf2(void)
 {
-    if (size > AUDIO_CHUNK_SIZE) {
-        return false;
-    }
-
-    // Wait for space to be available (with timeout to prevent deadlock)
-    if (k_sem_take(&rb->space_available, K_MSEC(100)) != 0) {
-        printk("Ring buffer full, dropping audio chunk\n");
-        return false;
-    }
-
-    k_mutex_lock(&rb->mutex, K_FOREVER);
-
-    // Copy data to the write buffer
-    memcpy(rb->chunks[rb->write_idx].buffer, data, size);
-    rb->chunks[rb->write_idx].filled = true;
-
-    // Advance write index
-    rb->write_idx = (rb->write_idx + 1) % AUDIO_BUFFER_CHUNKS;
-
-    k_mutex_unlock(&rb->mutex);
-
-    // Signal that data is ready
-    k_sem_give(&rb->data_ready);
-
-    return true;
-}
-
-static bool ring_buffer_read(AudioRingBuffer *rb, uint8_t *data, size_t *size)
-{
-    // Wait for data to be available
-    if (k_sem_take(&rb->data_ready, K_MSEC(100)) != 0) {
-        return false;
-    }
-
-    k_mutex_lock(&rb->mutex, K_FOREVER);
-
-    // Copy data from the read buffer
-    memcpy(data, rb->chunks[rb->read_idx].buffer, AUDIO_CHUNK_SIZE);
-    *size = AUDIO_CHUNK_SIZE;
-    rb->chunks[rb->read_idx].filled = false;
-
-    // Advance read index
-    rb->read_idx = (rb->read_idx + 1) % AUDIO_BUFFER_CHUNKS;
-
-    k_mutex_unlock(&rb->mutex);
-
-    // Signal that space is available
-    k_sem_give(&rb->space_available);
-
-    return true;
-}
-
-// Audio input thread - records audio and pushes to ring buffer
-static void audio_input_thread(void *arg1, void *arg2, void *arg3)
-{
-    (void)arg1;
-    (void)arg2;
-    (void)arg3;
-
-    printk("Audio input thread started\n");
-
-    static uint8_t
-        chunk_buffer[AUDIO_CHUNK_SIZE
-                     * AUDIO_INPUT_CHANNEL_COUNT /* channel input MIC + RTX */];
-
-    while (s_audio_streaming) {
-        k_mutex_lock(&s_audio_mutex, K_FOREVER);
-
-        // Check if we have any active recording sources
-        bool has_mic_source = false;
-        bool has_rtx_source = false;
-
-        for (int i = 0; i < s_active_path_count; i++) {
-            if (!s_active_paths[i].active)
-                continue;
-
-            if (s_active_paths[i].source == SOURCE_MIC) {
-                has_mic_source = true;
-            } else if (s_active_paths[i].source == SOURCE_RTX) {
-                has_rtx_source = true;
-            }
-        }
-
-        k_mutex_unlock(&s_audio_mutex);
-
-        ssize_t read_size =
-            AudioRecord_read(&s_record, chunk_buffer,
-                             AUDIO_CHUNK_SIZE * AUDIO_INPUT_CHANNEL_COUNT);
-
-        // Record audio from active source
-        if (has_mic_source) {
-            if (read_size > 0) {
-                // Deinterleave MIC and RTX data
-                for (size_t i = 0; i < AUDIO_CHUNK_SAMPLES; i++) {
-                    chunk_buffer[i * 2] = chunk_buffer
-                        [i * 4]; // MIC data (assuming MIC is on the first channel)
-                    chunk_buffer[i * 2 + 1] = chunk_buffer[i * 4 + 1];
-                }
-                read_size = AUDIO_CHUNK_SAMPLES
-                          * sizeof(int16_t); // Update read size
-                // Push to ring buffer for output thread
-                if (!ring_buffer_write(&s_ring_buffer, chunk_buffer,
-                                       read_size)) {
-                    // Buffer overflow handled in ring_buffer_write
-                }
-            }
-        } else if (has_rtx_source) {
-            if (read_size > 0) {
-                // Deinterleave MIC and RTX data
-                for (size_t i = 0; i < AUDIO_CHUNK_SAMPLES; i++) {
-                    chunk_buffer[i * 2] = chunk_buffer
-                        [i * 4
-                         + 2]; // MIC data (assuming MIC is on the first channel)
-                    chunk_buffer[i * 2 + 1] = chunk_buffer[i * 4 + 1 + 2];
-                }
-                read_size = AUDIO_CHUNK_SAMPLES
-                          * sizeof(int16_t); // Update read size
-                // Push to ring buffer for output thread
-                if (!ring_buffer_write(&s_ring_buffer, chunk_buffer,
-                                       read_size)) {
-                    // Buffer overflow handled in ring_buffer_write
-                }
-            }
-        } else {
-            // Sleep if no active recording
-            k_sleep(K_MSEC(10));
-        }
-    }
-
-    printk("Audio input thread stopped\n");
-}
-
-/* Audio output thread - pulls from ring buffer and plays audio */
-static void audio_output_thread(void *arg1, void *arg2, void *arg3)
-{
-    (void)arg1;
-    (void)arg2;
-    (void)arg3;
-
-    printk("Audio output thread started\n");
-
-    static uint8_t chunk_buffer[AUDIO_CHUNK_SIZE];
-    size_t chunk_size;
-
-    while (s_audio_streaming) {
-        k_mutex_lock(&s_audio_mutex, K_FOREVER);
-
-        // Check if we have any active playback sinks
-        bool has_spk_sink = false;
-        bool has_rtx_sink = false;
-
-        for (int i = 0; i < s_active_path_count; i++) {
-            if (!s_active_paths[i].active)
-                continue;
-
-            if (s_active_paths[i].sink == SINK_SPK) {
-                has_spk_sink = true;
-            } else if (s_active_paths[i].sink == SINK_RTX) {
-                has_rtx_sink = true;
-            }
-        }
-
-        k_mutex_unlock(&s_audio_mutex);
-
-        // Play audio to SPK if needed
-        if (has_spk_sink) {
-            // Pull from ring buffer
-            if (ring_buffer_read(&s_ring_buffer, chunk_buffer, &chunk_size)) {
-                // Write to speaker track
-                ssize_t written = AudioTrack_write(&s_track_spk, chunk_buffer,
-                                                   chunk_size);
-
-                if (written < 0) {
-                    printk("AudioTrack_write failed: %d\n", (int)written);
-                }
-            }
-        } else if (has_rtx_sink) {
-            // Pull from ring buffer
-            if (ring_buffer_read(&s_ring_buffer, chunk_buffer, &chunk_size)) {
-                // Write to RTX output track
-                ssize_t written = AudioTrack_write(&s_track_rtx_output,
-                                                   chunk_buffer, chunk_size);
-
-                if (written < 0) {
-                    printk("AudioTrack_write failed: %d\n", (int)written);
-                }
-            }
-        } else {
-            // Sleep if no active playback
-            k_sleep(K_MSEC(10));
-        }
-    }
-
-    printk("Audio output thread stopped\n");
-}
-
-void audio_init()
-{
-    int ret;
-
-    if (s_audio_initialized) {
-        printk("Audio already initialized\n");
+    const uintptr_t adc = AON_VAD_BASE + 0x20000;
+    uint32_t r5 = sys_read32(adc + 0x14);
+    uint32_t before = sys_read32(adc + 0x18);
+    /* Only touch an enabled ADC that has been released from reset. */
+    if ((r5 & (BIT(7) | BIT(8))) != (BIT(7) | BIT(8))) {
+        LOG_ERR("ADC01 HPF2 bypass skipped: inactive R5=%08x R6=%08x", r5,
+                before);
         return;
     }
+    sys_write32(before & ~BIT(14), adc + 0x18);
+    __DSB();
+    uint32_t after = sys_read32(adc + 0x18);
+    if (after != (before & ~BIT(14)))
+        LOG_ERR("ADC01 HPF2 bypass readback mismatch");
+}
 
-    printk("Initializing audio subsystem\n");
-
-    // Configure speaker enable (don't set it as output if you want to use SWD debugging!)
-    gpio_pin_configure_dt(&speaker_enable, GPIO_OUTPUT);
-
-    gpio_pin_configure_dt(&dtmf_enable, GPIO_OUTPUT);
-
-    // DT_EN (Audio routing control for BK4819): 0 = DSP left channel output to AMP, 1 = DTMF from BK4819 to AMP
-    gpio_pin_set_dt(&dtmf_enable, 0); // DSP left channel output to amplifier
-
-    // Initialize mutex
-    k_mutex_init(&s_audio_mutex);
-
-    // Initialize ring buffer
-    ring_buffer_init(&s_ring_buffer);
-
-    // Initialize active paths array
-    for (int i = 0; i < 3; i++) {
-        s_active_paths[i].active = false;
-    }
-    s_active_path_count = 0;
-
-    // Set audio system parameters
+static int configure_adc_gain(void)
+{
     String8 param;
-    String8_ctor_char(&param, "ADC_PDM_GAIN_A_LEFT=6;"
-                              "ADC_PDM_GAIN_D_LEFT=20;"
-                              "ADC_PDM_GAIN_A_RIGHT=6;"
-                              "ADC_PDM_GAIN_D_RIGHT=20");
+    String8_ctor_char(&param, "ADC_PDM_GAIN_A_LEFT=6;ADC_PDM_GAIN_D_LEFT=20;"
+                              "ADC_PDM_GAIN_A_RIGHT=6;ADC_PDM_GAIN_D_RIGHT=20");
+    int ret = AudioSystem_setParameters(0, &param);
+    String8_dtor(&param);
+    return ret;
+}
+
+void audio_init(void)
+{
+    k_mutex_lock(&audio_mutex, K_FOREVER);
+    if (initialized || terminating) {
+        k_mutex_unlock(&audio_mutex);
+        return;
+    }
+    /* These pins belong to audio, following the C62 platform split. */
+    gpio_pin_configure_dt(&speaker_enable, GPIO_OUTPUT_INACTIVE);
+    gpio_pin_configure_dt(&dtmf_enable, GPIO_OUTPUT_INACTIVE);
+    const char *stage = "ADC gain";
+    audio_restore_console();
+    int ret = configure_adc_gain();
+    if (ret != 0)
+        goto fail;
+    String8 param;
+    /* Configure ADC and DAC before opening streams; no ECHO. */
+    stage = "48k ADC/DAC configuration";
+    char config[64];
+    snprintf(config, sizeof(config), "samplingRate=%u;channels=%u",
+             (unsigned int)DSP_SAMPLE_RATE, (unsigned int)RECORD_CHANNELS);
+    String8_ctor_char(&param, config);
     ret = AudioSystem_setParameters(0, &param);
     String8_dtor(&param);
-    if (ret != 0) {
-        printk("Failed to set audio parameters: %d\n", ret);
-        return;
-    }
+    if (ret != 0)
+        goto fail;
+    stage = "48k recording constructor";
+    ret = AudioRecord_ctor(&record, 0, DSP_SAMPLE_RATE, PCM_16_BIT,
+                           RECORD_CHANNELS, CAPTURE_FRAME_SAMPLES, NULL);
+    if (ret != 0)
+        goto fail;
 
-    // Initialize AudioRecord for MIC and RTX input interleaved
-    ret = AudioRecord_ctor(&s_record, 0, SAMPLE_RATE, PCM_16_BIT,
-                           C62_AUDIO_CHANNEL_MIC | C62_AUDIO_CHANNEL_RX, 0,
-                           NULL);
-    if (ret != 0) {
-        printk("Failed to initialize AudioRecord RTX_INPUT: %d\n", ret);
-        return;
+    /* Refresh the input layout changed by SDK openRecord. */
+    stage = "recording buffer layout";
+    struct ICStreamShare *share = refresh_stream_layout(record.mICStream);
+    if (share->sampleCountPerFrame != record.mCblk->frameCount
+        || share->channelCount != record.mCblk->channels
+        || share->sampleCountPerFrame <= 0 || share->channelCount < 2) {
+        LOG_ERR("DSP input stream configuration mismatch");
+        ret = -EINVAL;
+        goto fail_record;
     }
-
-    // Initialize AudioTrack for speaker output
-    ret = AudioTrack_ctor(&s_track_spk, SAMPLE_RATE, PCM_16_BIT,
-                          C62_AUDIO_CHANNEL_SPK, 0, NULL);
-    if (ret != 0) {
-        printk("Failed to initialize AudioTrack SPK: %d\n", ret);
-        AudioRecord_dtor(&s_record);
-        return;
+    stage = "48k stereo playback constructor";
+    ret = AudioTrack_ctor(&playback_track, DSP_SAMPLE_RATE, PCM_16_BIT,
+                          CHANNEL_OUT_STEREO, 0, NULL);
+    if (ret != 0)
+        goto fail_record;
+    stage = "stereo playback buffer layout";
+    struct ICStreamShare *out = refresh_stream_layout(playback_track.mICStream);
+    if (playback_track.mCblk->channels != 2
+        || playback_track.mCblk->frameSize != 2 * sizeof(int16_t)
+        || out->channelCount != 2 || out->cellSize != sizeof(int16_t)
+        || out->sampleCountPerFrame <= 0) {
+        printk("C62 DSP output: channels=%d frameSize=%d shared channels=%d "
+               "cellSize=%d\n",
+               playback_track.mCblk->channels, playback_track.mCblk->frameSize,
+               out->channelCount, out->cellSize);
+        ret = -ENOTSUP;
+        goto fail_playback;
     }
-
-    // Initialize AudioTrack for RTX output
-    ret = AudioTrack_ctor(&s_track_rtx_output, SAMPLE_RATE, PCM_16_BIT,
-                          C62_AUDIO_CHANNEL_TX, 0, NULL);
-    if (ret != 0) {
-        printk("Failed to initialize AudioTrack RTX_OUTPUT: %d\n", ret);
-        AudioRecord_dtor(&s_record);
-        AudioTrack_dtor(&s_track_spk);
-        return;
+    for (unsigned int i = 0; i < 2; i++) {
+        memset(&inputs[i], 0, sizeof(inputs[i]));
+        memset(&outputs[i], 0, sizeof(outputs[i]));
+        inputs[i].input = true;
+        inputs[i].endpoint = outputs[i].endpoint = i;
+        k_sem_init(&inputs[i].wake, 0, 1);
+        k_sem_init(&outputs[i].wake, 0, 1);
+        queue_reset(&bypass[i]);
     }
-
-    s_audio_initialized = true;
-    printk("Audio subsystem initialized successfully\n");
+    memset(paths, 0, sizeof(paths));
+    record_active = false;
+    output_active[0] = output_active[1] = playback_active = false;
+    audio_restore_console();
+    LOG_INF("Audio ready: channels=%d samples/frame=%d; ADC=%d DAC=%d Hz",
+            share->channelCount, share->sampleCountPerFrame, DSP_SAMPLE_RATE,
+            DSP_SAMPLE_RATE);
+    initialized = worker_running = true;
+    k_thread_create(&worker, worker_stack, K_THREAD_STACK_SIZEOF(worker_stack),
+                    audio_worker, NULL, NULL, NULL, 5, 0, K_NO_WAIT);
+    k_thread_name_set(&worker, "c62_audio");
+    k_mutex_unlock(&audio_mutex);
+    return;
+fail_playback:
+    AudioTrack_dtor(&playback_track);
+fail_record:
+    AudioRecord_dtor(&record);
+fail:
+    audio_restore_console();
+    LOG_ERR("Audio initialization failed at %s: %d", stage, ret);
+    k_mutex_unlock(&audio_mutex);
 }
 
-void audio_terminate()
+/* Keep vendor device lifetime separate from individual software streams. */
+static void update_devices(void)
 {
-    if (!s_audio_initialized) {
-        return;
+    bool capture = false;
+    bool rx = false;
+    for (unsigned int sink = 0; sink < 3; sink++) {
+        capture |= paths[SOURCE_MIC][sink] || paths[SOURCE_RTX][sink];
+        rx |= paths[SOURCE_RTX][sink];
     }
+    if (capture != record_active) {
+        if (capture) {
+            AudioRecord_start(&record);
+            disable_adc_hpf2();
+        } else
+            AudioRecord_stop(&record);
+        record_active = capture;
+    }
+    if (rx)
+        radio_enableAfOutput();
+    else
+        radio_disableAfOutput();
 
-    printk("Terminating audio subsystem\n");
-
-    // Stop streaming if active
-    if (s_audio_streaming) {
-        s_audio_streaming = false;
-
-        // Wait for both threads to finish
-        k_thread_join(&s_audio_input_thread, K_SECONDS(1));
-        k_thread_join(&s_audio_output_thread, K_SECONDS(1));
-
-        // Stop all active devices
-        if (s_mic_active || s_rtx_input_active) {
-            AudioRecord_stop(&s_record);
-            s_mic_active = false;
-            s_rtx_input_active = false;
-        }
-        if (s_spk_active) {
-            AudioTrack_stop(&s_track_spk);
-            s_spk_active = false;
-        }
-        if (s_rtx_output_active) {
-            AudioTrack_stop(&s_track_rtx_output);
-            s_rtx_output_active = false;
+    bool playback[2] = { false, false };
+    for (unsigned int sink = 0; sink < 2; sink++) {
+        for (unsigned int source = 0; source < 3; source++)
+            playback[sink] |= paths[source][sink];
+        if (!playback[sink] && output_active[sink]) {
+            queue_reset(&bypass[sink]);
+            queue_reset(&outputs[sink].queue);
         }
     }
-
-    // Clean up audio objects
-    AudioRecord_dtor(&s_record);
-    AudioTrack_dtor(&s_track_spk);
-    AudioTrack_dtor(&s_track_rtx_output);
-
-    // Clear all paths
-    k_mutex_lock(&s_audio_mutex, K_FOREVER);
-    for (int i = 0; i < 3; i++) {
-        s_active_paths[i].active = false;
-    }
-    s_active_path_count = 0;
-    k_mutex_unlock(&s_audio_mutex);
-
-    s_audio_initialized = false;
-    printk("Audio subsystem terminated\n");
+    set_playback_active(playback[SINK_SPK], playback[SINK_RTX]);
+    gpio_pin_set_dt(&speaker_enable, output_active[SINK_SPK]);
 }
 
 void audio_connect(const enum AudioSource source, const enum AudioSink sink)
 {
-    if (!s_audio_initialized) {
-        printk("Audio not initialized, initializing now\n");
-        audio_init();
+    if (source > SOURCE_MCU || sink > SINK_MCU)
+        return;
+    audio_init();
+    k_mutex_lock(&audio_mutex, K_FOREVER);
+    if (initialized && !paths[source][sink]) {
+        paths[source][sink] = true;
+        update_devices();
     }
-
-    if (PATH(source, sink) == PATH(SOURCE_RTX, SINK_SPK)) {
-        radio_enableAfOutput();
-        gpio_pin_set_dt(&speaker_enable, 1);
-    }
-
-    k_mutex_lock(&s_audio_mutex, K_FOREVER);
-
-    // Check if path already exists
-    for (int i = 0; i < s_active_path_count; i++) {
-        if (s_active_paths[i].source == source && s_active_paths[i].sink == sink
-            && s_active_paths[i].active) {
-            printk("Audio path already connected: %d->%d\n", source, sink);
-            k_mutex_unlock(&s_audio_mutex);
-            return;
-        }
-    }
-
-    // Add new path
-    if (s_active_path_count < 3) {
-        s_active_paths[s_active_path_count].source = source;
-        s_active_paths[s_active_path_count].sink = sink;
-        s_active_paths[s_active_path_count].active = true;
-        s_active_path_count++;
-
-        printk("Audio path will connect: %d->%d (total: %d)\n", source, sink,
-               s_active_path_count);
-
-        AudioRecord_start(&s_record);
-        // Start the appropriate source device based on the path
-        if (source == SOURCE_MIC && !s_mic_active) {
-            s_mic_active = true;
-            printk("Started input\n");
-        } else if (source == SOURCE_RTX && !s_rtx_input_active) {
-            s_rtx_input_active = true;
-            printk("Started RTX input\n");
-        }
-
-        // Start the appropriate sink device based on the path
-        if (sink == SINK_SPK && !s_spk_active) {
-            AudioTrack_start(&s_track_spk);
-            s_spk_active = true;
-            printk("Started SPK output\n");
-        } else if (sink == SINK_RTX && !s_rtx_output_active) {
-            AudioTrack_start(&s_track_rtx_output);
-            s_rtx_output_active = true;
-            printk("Started RTX output\n");
-        }
-
-        // Start streaming thread if not already running
-        if (!s_audio_streaming) {
-            s_audio_streaming = true;
-
-            // Create input thread (recording)
-            k_thread_create(&s_audio_input_thread, s_audio_input_stack,
-                            AUDIO_THREAD_STACK_SIZE, audio_input_thread, NULL,
-                            NULL, NULL, AUDIO_THREAD_PRIORITY, 0, K_NO_WAIT);
-            k_thread_name_set(&s_audio_input_thread, "audio_input");
-
-            // Create output thread (playback)
-            k_thread_create(&s_audio_output_thread, s_audio_output_stack,
-                            AUDIO_THREAD_STACK_SIZE, audio_output_thread, NULL,
-                            NULL, NULL, AUDIO_THREAD_PRIORITY, 0, K_NO_WAIT);
-            k_thread_name_set(&s_audio_output_thread, "audio_output");
-
-            printk("Audio streaming threads started\n");
-        }
-    } else {
-        printk("Maximum audio paths reached\n");
-    }
-
-    k_mutex_unlock(&s_audio_mutex);
+    k_mutex_unlock(&audio_mutex);
 }
 
 void audio_disconnect(const enum AudioSource source, const enum AudioSink sink)
 {
-    if (!s_audio_initialized) {
+    if (source > SOURCE_MCU || sink > SINK_MCU)
+        return;
+    k_mutex_lock(&audio_mutex, K_FOREVER);
+    if (initialized && paths[source][sink]) {
+        paths[source][sink] = false;
+        if (sink == SINK_MCU && source != SOURCE_MCU)
+            stream_detach(&inputs[source]);
+        if (source == SOURCE_MCU && sink != SINK_MCU)
+            stream_detach(&outputs[sink]);
+        if (sink != SINK_MCU)
+            queue_reset(&bypass[sink]);
+        update_devices();
+    }
+    k_mutex_unlock(&audio_mutex);
+}
+
+void audio_terminate(void)
+{
+    k_mutex_lock(&audio_mutex, K_FOREVER);
+    if (!initialized) {
+        k_mutex_unlock(&audio_mutex);
         return;
     }
-
-    if (PATH(source, sink) == PATH(SOURCE_RTX, SINK_SPK)) {
-        gpio_pin_set_dt(&speaker_enable, 0);
-        radio_disableAfOutput();
+    worker_running = false;
+    terminating = true;
+    for (unsigned int i = 0; i < 2; i++) {
+        stream_detach(&inputs[i]);
+        stream_detach(&outputs[i]);
     }
-
-    k_mutex_lock(&s_audio_mutex, K_FOREVER);
-
-    // Find and remove the path
-    bool found = false;
-    for (int i = 0; i < s_active_path_count; i++) {
-        if (s_active_paths[i].source == source && s_active_paths[i].sink == sink
-            && s_active_paths[i].active) {
-            s_active_paths[i].active = false;
-            found = true;
-
-            // Compact array by moving last element to this position
-            if (i < s_active_path_count - 1) {
-                s_active_paths[i] = s_active_paths[s_active_path_count - 1];
-            }
-            s_active_path_count--;
-
-            printk("Audio path disconnected: %d->%d (remaining: %d)\n", source,
-                   sink, s_active_path_count);
+    memset(paths, 0, sizeof(paths));
+    update_devices();
+    initialized = false;
+    k_mutex_unlock(&audio_mutex);
+    k_thread_join(&worker, K_FOREVER);
+    /* Let cancelled callers leave before their state can be reinitialised. */
+    for (;;) {
+        k_mutex_lock(&audio_mutex, K_FOREVER);
+        bool busy = inputs[0].busy || inputs[1].busy || outputs[0].busy
+                 || outputs[1].busy;
+        k_mutex_unlock(&audio_mutex);
+        if (!busy)
             break;
-        }
+        k_sleep(K_MSEC(1));
     }
-
-    if (!found) {
-        printk("Audio path not found: %d->%d\n", source, sink);
-    }
-
-    // Stop streaming if no active paths
-    if (s_active_path_count == 0 && s_audio_streaming) {
-        s_audio_streaming = false;
-        k_mutex_unlock(&s_audio_mutex);
-
-        // Wait for both threads to finish
-        k_thread_join(&s_audio_input_thread, K_SECONDS(1));
-        k_thread_join(&s_audio_output_thread, K_SECONDS(1));
-
-        // Stop all active devices
-        if (s_mic_active || s_rtx_input_active) {
-            AudioRecord_stop(&s_record);
-            s_mic_active = false;
-            s_rtx_input_active = false;
-            printk("Stopped input\n");
-        }
-        if (s_spk_active) {
-            AudioTrack_stop(&s_track_spk);
-            s_spk_active = false;
-            printk("Stopped SPK output\n");
-        }
-        if (s_rtx_output_active) {
-            AudioTrack_stop(&s_track_rtx_output);
-            s_rtx_output_active = false;
-            printk("Stopped RTX output\n");
-        }
-
-        printk("Audio streaming stopped\n");
-    } else {
-        // Check if we need to stop any devices that are no longer used
-        bool mic_needed = false;
-        bool rtx_input_needed = false;
-        bool spk_needed = false;
-        bool rtx_output_needed = false;
-
-        // Check if any remaining paths use each device
-        for (int i = 0; i < s_active_path_count; i++) {
-            if (s_active_paths[i].active) {
-                if (s_active_paths[i].source == SOURCE_MIC)
-                    mic_needed = true;
-                if (s_active_paths[i].source == SOURCE_RTX)
-                    rtx_input_needed = true;
-                if (s_active_paths[i].sink == SINK_SPK)
-                    spk_needed = true;
-                if (s_active_paths[i].sink == SINK_RTX)
-                    rtx_output_needed = true;
-            }
-        }
-
-        // Stop devices that are no longer needed
-        if (!mic_needed && s_mic_active && !rtx_input_needed
-            && s_rtx_input_active) {
-            AudioRecord_stop(&s_record);
-            s_mic_active = false;
-            s_rtx_input_active = false;
-            printk("Stopped input\n");
-        }
-        if (!spk_needed && s_spk_active) {
-            AudioTrack_stop(&s_track_spk);
-            s_spk_active = false;
-            printk("Stopped SPK output\n");
-        }
-        if (!rtx_output_needed && s_rtx_output_active) {
-            AudioTrack_stop(&s_track_rtx_output);
-            s_rtx_output_active = false;
-            printk("Stopped RTX output\n");
-        }
-
-        k_mutex_unlock(&s_audio_mutex);
-    }
+    AudioRecord_dtor(&record);
+    AudioTrack_dtor(&playback_track);
+    k_mutex_lock(&audio_mutex, K_FOREVER);
+    terminating = false;
+    k_mutex_unlock(&audio_mutex);
 }
 
 bool audio_checkPathCompatibility(const enum AudioSource p1Source,
                                   const enum AudioSink p1Sink,
                                   const enum AudioSource p2Source,
                                   const enum AudioSink p2Sink)
-
 {
-    // If both paths use the same source, they're incompatible
-    if (p1Source == p2Source && p1Source != SOURCE_MCU) {
-        return false;
-    }
-
-    // If both paths use the same sink, they're incompatible
-    if (p1Sink == p2Sink && p1Sink != SINK_MCU) {
-        return false;
-    }
-
-    // MCU source/sink can be used multiple times (software buffers)
-    // Hardware sources/sinks (MIC, SPK, RTX) can only be used once
-
-    return true;
+    return (p1Source != p2Source || p1Source == SOURCE_MCU)
+        && (p1Sink != p2Sink || p1Sink == SINK_MCU);
 }
