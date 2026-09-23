@@ -159,6 +159,13 @@
 	};
 };
 
+/* Reserve SRAM bank 4 (0xc0000..0xcffff, data alias 0x200c0000)
+ * for DSP shared audio; exclude it from application data and the heap.
+ */
+&sram0 {
+    reg = <0x80000 DT_SIZE_K(256)>;
+};
+
 &gpioa {
 	status = "okay";
 	reg = <0x45900000 0x1000>;
@@ -243,46 +250,20 @@
 		#address-cells = <1>;
 		#size-cells = <1>;
 		
-		/* 256KB for bootloader */
-		boot_partition: partition@0 {
-			reg = <0x0 0x40000>;
-			read-only;
-		};
-		
-		/* application image slot: 512KB */
-		slot0_partition: partition@40000 {
-			reg = <0x40000 0x80000>;
-		};
-		
-		/* backup slot: 512KB */
-		slot1_partition: partition@c0000 {
-			reg = <0xc0000 0x80000>;
-		};
+        /* The application is linked at flash offset zero. */
+        slot0_partition: partition@0 {
+            reg = <0x0 DT_SIZE_M(1)>;
+        };
 
-		dsp_firmware: partition@100000 {
+        /* DSP image is copied from flash to PSRAM at startup. */
+        dsp_firmware: partition@100000 {
             label = "dsp_firmware";
             reg = <0x100000 DT_SIZE_M(1)>;
-    	};
-		
-		/* swap slot: 128KB */
-		scratch_partition: partition@140000 {
-			reg = <0x140000 0x20000>;
-		};
-		
-		/* wifi driver private storage: 8Kb */
-		wifi_driver_storage: partition@6ee000 {
-			reg = <0x6ee000 0x2000>;
-		};
-		
-		/* wifi_nvs_storage: 20Kb */
-		wifi_nvs_storage: partition@6F0000 {
-			reg = <0x6F0000 0x10000>;
-		};
-		
-		/* storage: 6.625MB for storage */
-		storage_partition: partition@700000 {
-			reg = <0x700000 0x100000>;
-		};
+        };
+
+        storage_partition: partition@300000 {
+            reg = <0x300000 DT_SIZE_M(1)>;
+        };
 	};
 };
 
@@ -291,18 +272,18 @@
 	#address-cells = <1>;
 	#size-cells = <1>;
 	
-	/*psram for cp core (DSP) slot: 2MB */
+	/* DSP PSRAM arena; the closed firmware heap limit is unverified. */
 	psram_cp: psram_cp@30000000 {
 		compatible = "listenai,csk6-psram-partition";
 		reg = <0x30000000 0x200000>;
 		status = "okay";
 	};
 	
-	/*psram for ap core slot: 2MB */
+	/* Leave the top 256 KiB clear for the DSP stack at CP 0x60400000. */
 	psram_ap: psram_ap@30200000 {
 		compatible = "zephyr,memory-region",
 		"listenai,csk6-psram-partition";
-		reg = <0x30200000 0x200000>;
+		reg = <0x30200000 0x1c0000>;
 		status = "okay";
 		zephyr,memory-region = "PSRAMAP";
 	};
@@ -376,4 +357,3 @@ zephyr_udc0: &usbotg {
 	current-speed = <115200>;
 	status = "okay";
 };
-

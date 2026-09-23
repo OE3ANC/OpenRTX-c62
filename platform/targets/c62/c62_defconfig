@@ -18,3 +18,6 @@ CONFIG_ST7735R=y
 
 # C62 LSF service controller, see Kconfig.board
 CONFIG_LSF_SERVICE_CONTROLLER=y
+
+# Reserve flash above 1 MiB for the DSP image.
+CONFIG_FLASH_LOAD_SIZE=0x100000

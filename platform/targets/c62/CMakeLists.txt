@@ -41,3 +41,13 @@ target_include_directories(app
 )
 
 target_compile_definitions(app PRIVATE PLATFORM_C62)
+
+# Keep the exact host/DSP pairing reproducible and expose the flash artifact.
+set(C62_DSP_IMAGE ${OPENRTX_ROOT}/platform/targets/c62/resources/dsp_firmware.bin)
+file(SHA256 ${C62_DSP_IMAGE} C62_DSP_SHA256)
+if(NOT C62_DSP_SHA256 STREQUAL
+   "9579b617f048c646465118f6d0b9e1b765b4d7d811ff9c8649c5754fe45a8903")
+    message(FATAL_ERROR "C62 requires the pinned SDK 2ac60552 DSP firmware")
+endif()
+configure_file(${C62_DSP_IMAGE} ${CMAKE_BINARY_DIR}/zephyr/dsp_firmware.bin
+               COPYONLY)
