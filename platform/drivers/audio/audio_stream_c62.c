@@ -10,19 +10,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <zephyr/kernel.h>
-#include <zephyr/drivers/gpio.h>
-#include <zephyr/drivers/pinctrl.h>
-#include <zephyr/drivers/uart.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/sys_io.h>
-#include <interfaces/audio.h>
-#include <hwconfig.h>
-#include <interfaces/radio.h>
+#include "audio_stream_c62.h"
 #include "AudioSystem.h"
 #include "AudioTrack.h"
 #include "AudioRecord.h"
 
-LOG_MODULE_REGISTER(c62_audio, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(c62_audio_stream, LOG_LEVEL_INF);
 
 #define DSP_SAMPLE_RATE 48000
 /* Request an explicit 10 ms capture frame. */
@@ -70,14 +65,11 @@ static bool playback_active;
 static struct k_thread worker;
 K_THREAD_STACK_DEFINE(worker_stack, AUDIO_STACK_SIZE);
 
-/* Separate queues prevent MIC/RX and speaker/TX from stealing each other's data. */
+/* One queue per physical endpoint. FM and application playback share output
+ * queues because path compatibility allows only one source per output. */
 static struct audio_stream inputs[2] __attribute__((section(".psram_section")));
 static struct audio_stream outputs[2]
     __attribute__((section(".psram_section")));
-static struct sample_queue bypass[2] __attribute__((section(".psram_section")));
-
-static const bool input_config = true;
-static const bool output_config = false;
 
 static void queue_reset(struct sample_queue *queue)
 {
@@ -165,9 +157,11 @@ static void capture_frame(void)
             for (unsigned int sink = 0; sink < 2; sink++) {
                 if (!paths[source][sink])
                     continue;
-                if (bypass[sink].count == QUEUE_SAMPLES)
-                    queue_pop(&bypass[sink]);
-                queue_push(&bypass[sink], sample);
+                /* Physical paths and application playback are exclusive. */
+                struct sample_queue *queue = &outputs[sink].queue;
+                if (queue->count == QUEUE_SAMPLES)
+                    queue_pop(queue);
+                queue_push(queue, sample);
             }
         }
         k_sem_give(&stream->wake);
@@ -193,8 +187,7 @@ static void play_queued_audio(void)
         return;
     bool pending = false;
     for (unsigned int sink = 0; sink < 2; sink++)
-        pending |= output_active[sink]
-                && (outputs[sink].queue.count || bypass[sink].count);
+        pending |= output_active[sink] && outputs[sink].queue.count;
     if (!pending)
         return;
 
@@ -206,14 +199,10 @@ static void play_queued_audio(void)
         return;
     for (size_t i = 0; i < buffer.frameCount; i++) {
         for (unsigned int sink = 0; sink < 2; sink++) {
-            int32_t sample = 0;
-            if (output_active[sink]) {
-                if (outputs[sink].queue.count)
-                    sample += queue_pop(&outputs[sink].queue);
-                if (bypass[sink].count)
-                    sample += queue_pop(&bypass[sink]);
-            }
-            buffer.i16[2 * i + sink] = CLAMP(sample, INT16_MIN, INT16_MAX);
+            struct sample_queue *queue = &outputs[sink].queue;
+            buffer.i16[2 * i + sink] = output_active[sink] && queue->count ?
+                                           queue_pop(queue) :
+                                           0;
         }
     }
     AudioTrack_releaseBuffer(&playback_track, &buffer);
@@ -535,47 +524,13 @@ static void stream_stop(struct streamCtx *ctx)
     stream_terminate(ctx);
 }
 
-static const struct audioDriver stream_driver = {
+const struct audioDriver c62_stream_driver = {
     .start = stream_start,
     .data = stream_data,
     .sync = stream_sync,
     .stop = stream_stop,
     .terminate = stream_terminate,
 };
-
-const struct audioDevice outputDevices[] = {
-    { NULL, NULL, 0, SINK_MCU },
-    { &stream_driver, &output_config, SINK_RTX, SINK_RTX },
-    { &stream_driver, &output_config, SINK_SPK, SINK_SPK },
-};
-
-const struct audioDevice inputDevices[] = {
-    { NULL, NULL, 0, SOURCE_MCU },
-    { &stream_driver, &input_config, SOURCE_RTX, SOURCE_RTX },
-    { &stream_driver, &input_config, SOURCE_MIC, SOURCE_MIC },
-};
-
-/* CP can reprogram shared pinmux and UART registers during audio setup.
- * Reassert the board console configuration without changing IRQ ownership. */
-PINCTRL_DT_DEFINE(DT_CHOSEN(zephyr_console));
-
-static void audio_restore_console(void)
-{
-    const struct device *console = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
-    const struct uart_config config = {
-        .baudrate = DT_PROP(DT_CHOSEN(zephyr_console), current_speed),
-        .parity = UART_CFG_PARITY_NONE,
-        .stop_bits = UART_CFG_STOP_BITS_1,
-        .data_bits = UART_CFG_DATA_BITS_8,
-        .flow_ctrl = UART_CFG_FLOW_CTRL_NONE,
-    };
-    int pins = pinctrl_apply_state(
-        PINCTRL_DT_DEV_CONFIG_GET(DT_CHOSEN(zephyr_console)),
-        PINCTRL_STATE_DEFAULT);
-    int uart = uart_configure(console, &config);
-    if (pins != 0 || uart != 0)
-        LOG_ERR("Console configuration failed: pins=%d uart=%d", pins, uart);
-}
 
 /* Refresh the shared layout after the DSP opens or reconfigures a stream. */
 static struct ICStreamShare *refresh_stream_layout(ICStream *stream)
@@ -621,18 +576,15 @@ static int configure_adc_gain(void)
     return ret;
 }
 
-void audio_init(void)
+int c62_stream_init(void)
 {
     k_mutex_lock(&audio_mutex, K_FOREVER);
     if (initialized || terminating) {
+        int ret = terminating ? -EBUSY : 0;
         k_mutex_unlock(&audio_mutex);
-        return;
+        return ret;
     }
-    /* These pins belong to audio, following the C62 platform split. */
-    gpio_pin_configure_dt(&speaker_enable, GPIO_OUTPUT_INACTIVE);
-    gpio_pin_configure_dt(&dtmf_enable, GPIO_OUTPUT_INACTIVE);
     const char *stage = "ADC gain";
-    audio_restore_console();
     int ret = configure_adc_gain();
     if (ret != 0)
         goto fail;
@@ -688,12 +640,10 @@ void audio_init(void)
         inputs[i].endpoint = outputs[i].endpoint = i;
         k_sem_init(&inputs[i].wake, 0, 1);
         k_sem_init(&outputs[i].wake, 0, 1);
-        queue_reset(&bypass[i]);
     }
     memset(paths, 0, sizeof(paths));
     record_active = false;
     output_active[0] = output_active[1] = playback_active = false;
-    audio_restore_console();
     LOG_INF("Audio ready: channels=%d samples/frame=%d; ADC=%d DAC=%d Hz",
             share->channelCount, share->sampleCountPerFrame, DSP_SAMPLE_RATE,
             DSP_SAMPLE_RATE);
@@ -702,25 +652,23 @@ void audio_init(void)
                     audio_worker, NULL, NULL, NULL, 5, 0, K_NO_WAIT);
     k_thread_name_set(&worker, "c62_audio");
     k_mutex_unlock(&audio_mutex);
-    return;
+    return 0;
 fail_playback:
     AudioTrack_dtor(&playback_track);
 fail_record:
     AudioRecord_dtor(&record);
 fail:
-    audio_restore_console();
     LOG_ERR("Audio initialization failed at %s: %d", stage, ret);
     k_mutex_unlock(&audio_mutex);
+    return ret;
 }
 
 /* Keep vendor device lifetime separate from individual software streams. */
 static void update_devices(void)
 {
     bool capture = false;
-    bool rx = false;
     for (unsigned int sink = 0; sink < 3; sink++) {
         capture |= paths[SOURCE_MIC][sink] || paths[SOURCE_RTX][sink];
-        rx |= paths[SOURCE_RTX][sink];
     }
     if (capture != record_active) {
         if (capture) {
@@ -730,56 +678,40 @@ static void update_devices(void)
             AudioRecord_stop(&record);
         record_active = capture;
     }
-    if (rx)
-        radio_enableAfOutput();
-    else
-        radio_disableAfOutput();
 
     bool playback[2] = { false, false };
     for (unsigned int sink = 0; sink < 2; sink++) {
         for (unsigned int source = 0; source < 3; source++)
             playback[sink] |= paths[source][sink];
         if (!playback[sink] && output_active[sink]) {
-            queue_reset(&bypass[sink]);
             queue_reset(&outputs[sink].queue);
         }
     }
     set_playback_active(playback[SINK_SPK], playback[SINK_RTX]);
-    gpio_pin_set_dt(&speaker_enable, output_active[SINK_SPK]);
 }
 
-void audio_connect(const enum AudioSource source, const enum AudioSink sink)
+void c62_stream_set_route(enum AudioSource source, enum AudioSink sink,
+                          bool enabled)
 {
     if (source > SOURCE_MCU || sink > SINK_MCU)
         return;
-    audio_init();
     k_mutex_lock(&audio_mutex, K_FOREVER);
-    if (initialized && !paths[source][sink]) {
-        paths[source][sink] = true;
+    if (initialized && paths[source][sink] != enabled) {
+        paths[source][sink] = enabled;
+        if (!enabled) {
+            if (sink == SINK_MCU && source != SOURCE_MCU)
+                stream_detach(&inputs[source]);
+            if (source == SOURCE_MCU && sink != SINK_MCU)
+                stream_detach(&outputs[sink]);
+            if (sink != SINK_MCU)
+                queue_reset(&outputs[sink].queue);
+        }
         update_devices();
     }
     k_mutex_unlock(&audio_mutex);
 }
 
-void audio_disconnect(const enum AudioSource source, const enum AudioSink sink)
-{
-    if (source > SOURCE_MCU || sink > SINK_MCU)
-        return;
-    k_mutex_lock(&audio_mutex, K_FOREVER);
-    if (initialized && paths[source][sink]) {
-        paths[source][sink] = false;
-        if (sink == SINK_MCU && source != SOURCE_MCU)
-            stream_detach(&inputs[source]);
-        if (source == SOURCE_MCU && sink != SINK_MCU)
-            stream_detach(&outputs[sink]);
-        if (sink != SINK_MCU)
-            queue_reset(&bypass[sink]);
-        update_devices();
-    }
-    k_mutex_unlock(&audio_mutex);
-}
-
-void audio_terminate(void)
+void c62_stream_terminate(void)
 {
     k_mutex_lock(&audio_mutex, K_FOREVER);
     if (!initialized) {
@@ -812,13 +744,4 @@ void audio_terminate(void)
     k_mutex_lock(&audio_mutex, K_FOREVER);
     terminating = false;
     k_mutex_unlock(&audio_mutex);
-}
-
-bool audio_checkPathCompatibility(const enum AudioSource p1Source,
-                                  const enum AudioSink p1Sink,
-                                  const enum AudioSource p2Source,
-                                  const enum AudioSink p2Sink)
-{
-    return (p1Source != p2Source || p1Source == SOURCE_MCU)
-        && (p1Sink != p2Sink || p1Sink == SINK_MCU);
 }
