@@ -26,7 +26,6 @@ target_sources(app
 
     ${OPENRTX_ROOT}/platform/targets/c62/platform.c
     ${OPENRTX_ROOT}/platform/targets/c62/hwconfig.c
-    ${OPENRTX_ROOT}/platform/targets/c62/tx_power.c
     ${OPENRTX_ROOT}/platform/drivers/audio/audio_c62.c
     ${OPENRTX_ROOT}/platform/drivers/audio/audio_stream_c62.c
     ${OPENRTX_ROOT}/platform/targets/c62/dsp.c

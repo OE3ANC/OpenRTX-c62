@@ -13,7 +13,6 @@
 
 #include "drivers/baseband/BK4819.h"
 #include "radioUtils.h"
-#include "tx_power.h"
 
 #include <zephyr/drivers/pwm.h>
 #include <zephyr/kernel.h>
@@ -38,6 +37,45 @@ static bool set_tx_power(uint8_t power_percent)
         printk("Failed to set TX power PWM: %d\n", ret);
     }
     return ret >= 0;
+}
+
+/* Starting estimates from measurements at 100 kHz PWM, not stock settings.
+ * Columns: provisional 1 / 2.5 / 5 W. Tune these six percentages on hardware.
+ * VHF at 145.550 MHz: 30/43/57% gave 1.1/1.4/2.5 W. Keep 30/57%;
+ * extrapolating the last two points suggests 89% for 5 W (unmeasured).
+ * UHF at 433.475 MHz: 31/52/74% gave 0.3/1.3/2.4 W. Interpolation gives
+ * 46% for 1 W; extrapolation gives 76% for 2.5 W. The 5 W extrapolation
+ * exceeds 100%, so that slot is capped at full drive, NOT a verified 5 W.
+ * No frequency compensation: one row per hardware band. Requests between
+ * nominal levels select the next bucket; this is not continuous calibration.
+ */
+static int select_tx_power(uint32_t frequency_hz, uint32_t power_mw)
+{
+    static const uint8_t duty_percent[2][3] = {
+        { 30, 57, 89 },  // VHF
+        { 46, 76, 100 }, // UHF
+    };
+
+    if (power_mw == 0 || power_mw > 5000)
+        return -1;
+
+    unsigned band;
+    if (frequency_hz >= 136000000 && frequency_hz <= 174000000)
+        band = 0;
+    else if (frequency_hz >= 400000000 && frequency_hz <= 480000000)
+        band = 1;
+    else
+        return -1;
+
+    unsigned level;
+    if (power_mw <= 1000)
+        level = 0;
+    else if (power_mw <= 2500)
+        level = 1;
+    else
+        level = 2;
+
+    return duty_percent[band][level];
 }
 
 static const rtxStatus_t
@@ -186,9 +224,6 @@ void radio_init(const rtxStatus_t *rtxState)
     bk4819_gpio_pin_set(&c62_bk4819, GPIO_ALC_TX_LED,
                         false); // ALC / TX LED
 
-    // Read-only startup diagnostic; both external PAs remain off.
-    c62_tx_power_dump_flash();
-
     /* MIC bias settles only with the ADC enabled and RX DSP disabled.
      * Keep both external PAs off; this delay is paid at startup, not PTT.
      */
@@ -306,17 +341,15 @@ void radio_enableTx()
 {
     // Unkey even when reconfiguring an already active transmitter.
     radio_disableRtx();
-    c62_tx_power_t power;
-    if (config->txDisable
-        || !c62_tx_power_lookup(config->txFrequency, config->txPower,
-                                &power)) {
+    int duty_percent = select_tx_power(config->txFrequency, config->txPower);
+    if (config->txDisable || duty_percent < 0) {
         printk("C62 TX rejected: %lumW %luHz provisional\n",
                (unsigned long)config->txPower,
                (unsigned long)config->txFrequency);
         return;
     }
 
-    if (!set_tx_power(power.duty_percent)) {
+    if (!set_tx_power(static_cast<uint8_t>(duty_percent))) {
         radio_disableRtx();
         return;
     }
@@ -324,7 +357,7 @@ void radio_enableTx()
            "PWM=100000Hz provisional\n",
            (unsigned long)config->txPower,
            (unsigned long)config->txFrequency,
-           (unsigned)power.duty_percent);
+           (unsigned)duty_percent);
 
     bk4819_set_freq(&c62_bk4819, config->txFrequency);
 
@@ -335,7 +368,7 @@ void radio_enableTx()
         bk4819_enable_tx_ctcss(&c62_bk4819, config->txTone);
     }
 
-    if (power.vhf) {
+    if (config->txFrequency <= 174000000) {
         bk4819_gpio_pin_set(&c62_bk4819, GPIO_VHF_TX_PA,
                             true); // VHF TX PA
     } else {
