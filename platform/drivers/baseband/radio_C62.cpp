@@ -9,11 +9,11 @@
 #include <interfaces/radio.h>
 #include <cstddef>
 
-#include <algorithm>
 #include <string>
 
 #include "drivers/baseband/BK4819.h"
 #include "radioUtils.h"
+#include "tx_power.h"
 
 #include <zephyr/drivers/pwm.h>
 #include <zephyr/kernel.h>
@@ -23,14 +23,11 @@
  * PWM Period: 1000us (1kHz), adjustable duty cycle for power level
  *
  * @param power_percent: 0-100 (0 = min power, 100 = max power)
+ * @return true if the PWM driver accepted the control
  */
-static void set_tx_power(uint8_t power_percent)
+static bool set_tx_power(uint8_t power_percent)
 {
-    //TODO: Check if this works... May need to adjust mapping of
-    // power_percent to duty cycle based on actual power output
-    // vs duty cycle curve of the PA, and also consider frequency
-    // dependence of PA efficiency
-
+    // Keep existing 1kHz PWM; changing to stock 100kHz is deferred.
     // Calculate duty cycle (1000us period = 1kHz)
     uint32_t period_us = 1000; // 1kHz PWM frequency
     uint32_t pulse_us = (period_us * power_percent) / 100;
@@ -40,6 +37,7 @@ static void set_tx_power(uint8_t power_percent)
     if (ret < 0) {
         printk("Failed to set TX power PWM: %d\n", ret);
     }
+    return ret >= 0;
 }
 
 static const rtxStatus_t
@@ -188,6 +186,9 @@ void radio_init(const rtxStatus_t *rtxState)
     bk4819_gpio_pin_set(&c62_bk4819, GPIO_ALC_TX_LED,
                         false); // ALC / TX LED
 
+    // Read-only startup diagnostic; both external PAs remain off.
+    c62_tx_power_dump_flash();
+
     /* MIC bias settles only with the ADC enabled and RX DSP disabled.
      * Keep both external PAs off; this delay is paid at startup, not PTT.
      */
@@ -303,22 +304,27 @@ void radio_enableRx()
 
 void radio_enableTx()
 {
-    if (config->txDisable == 1 || config->txFrequency < 136000000
-        || config->txFrequency > 600000000) {
-        radio_disableRtx();
+    // Unkey even when reconfiguring an already active transmitter.
+    radio_disableRtx();
+    c62_tx_power_t power;
+    if (config->txDisable
+        || !c62_tx_power_lookup(config->txFrequency, config->txPower,
+                                &power)) {
+        printk("C62 TX rejected: %lumW %luHz provisional\n",
+               (unsigned long)config->txPower,
+               (unsigned long)config->txFrequency);
         return;
     }
 
-    bk4819_gpio_pin_set(&c62_bk4819, GPIO_VHF_RX_LNA,
-                        false); // VHF RX LNA
-    bk4819_gpio_pin_set(&c62_bk4819, GPIO_UHF_RX_LNA,
-                        false); // UHF RX LNA
-    bk4819_gpio_pin_set(&c62_bk4819, GPIO_VHF_TX_PA,
-                        false); // VHF TX PA
-    bk4819_gpio_pin_set(&c62_bk4819, GPIO_UHF_TX_PA,
-                        false); // UHF TX PA
-    bk4819_gpio_pin_set(&c62_bk4819, GPIO_ALC_TX_LED,
-                        false); // ALC / TX LED
+    if (!set_tx_power(power.duty_percent)) {
+        radio_disableRtx();
+        return;
+    }
+    printk("C62 TX: %lumW %luHz duty=%u%% "
+           "PWM=1000Hz provisional\n",
+           (unsigned long)config->txPower,
+           (unsigned long)config->txFrequency,
+           (unsigned)power.duty_percent);
 
     bk4819_set_freq(&c62_bk4819, config->txFrequency);
 
@@ -329,7 +335,7 @@ void radio_enableTx()
         bk4819_enable_tx_ctcss(&c62_bk4819, config->txTone);
     }
 
-    if (config->txFrequency < 174000000) {
+    if (power.vhf) {
         bk4819_gpio_pin_set(&c62_bk4819, GPIO_VHF_TX_PA,
                             true); // VHF TX PA
     } else {
@@ -339,12 +345,6 @@ void radio_enableTx()
 
     bk4819_gpio_pin_set(&c62_bk4819, GPIO_ALC_TX_LED,
                         true); // ALC / TX LED
-
-    // depending on power level set PWM duty cycle for APC voltage control
-    // Maybe need table for this instead of crude linear mapping, and also consider frequency dependence of PA efficiency
-    set_tx_power(std::min(
-        config->txPower * config->txPower * 100 / (5000 * 5000),
-        100U)); // crude quadratic mapping of power to duty cycle, max at 5W
 
     bk4819_tx_on(&c62_bk4819);
     radioStatus = TX;

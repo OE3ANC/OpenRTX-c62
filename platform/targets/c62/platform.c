@@ -24,7 +24,7 @@ static const hwInfo_t hwInfo = {
     .uhf_maxFreq = 480,
     .uhf_minFreq = 400,
     .vhf_maxFreq = 174,
-    .vhf_minFreq = 137,
+    .vhf_minFreq = 136,
 };
 
 // ADC
