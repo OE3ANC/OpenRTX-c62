@@ -20,19 +20,19 @@
 
 /**
  * Set TX power using PWM on pin A03
- * PWM Period: 1000us (1kHz), adjustable duty cycle for power level
+ * PWM period: 10 us (100 kHz), matching the traced stock firmware.
  *
  * @param power_percent: 0-100 (0 = min power, 100 = max power)
  * @return true if the PWM driver accepted the control
  */
 static bool set_tx_power(uint8_t power_percent)
 {
-    // Keep existing 1kHz PWM; changing to stock 100kHz is deferred.
-    // Calculate duty cycle (1000us period = 1kHz)
-    uint32_t period_us = 1000; // 1kHz PWM frequency
-    uint32_t pulse_us = (period_us * power_percent) / 100;
+    // Calculate in nanoseconds: whole microseconds would quantize duty
+    // to 10% steps at 100 kHz. The driver handles timer-cycle rounding.
+    constexpr uint32_t tx_pwm_period_ns = 10000;
+    uint32_t pulse_ns = tx_pwm_period_ns * power_percent / 100;
 
-    int ret = pwm_set_dt(&pwm_rf_apc, PWM_USEC(period_us), PWM_USEC(pulse_us));
+    int ret = pwm_set_dt(&pwm_rf_apc, tx_pwm_period_ns, pulse_ns);
 
     if (ret < 0) {
         printk("Failed to set TX power PWM: %d\n", ret);
@@ -321,7 +321,7 @@ void radio_enableTx()
         return;
     }
     printk("C62 TX: %lumW %luHz duty=%u%% "
-           "PWM=1000Hz provisional\n",
+           "PWM=100000Hz provisional\n",
            (unsigned long)config->txPower,
            (unsigned long)config->txFrequency,
            (unsigned)power.duty_percent);

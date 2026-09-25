@@ -110,7 +110,8 @@ bool c62_tx_power_lookup(uint32_t frequency_hz, uint32_t power_mw,
  * uses channel byte 0 bits 7:6 to choose one of the four LE16 fields, and feeds
  * that value to a 100 kHz PWM driver. This establishes duty percentages, not
  * watts, low/high labels, or proof of individual factory calibration. Our
- * fixed 1/2.5/5 W labels remain provisional; current OpenRTX PWM stays 1 kHz.
+ * fixed 1/2.5/5 W labels remain provisional; OpenRTX now requests 100 kHz
+ * for comparison against the earlier 1 kHz hardware measurements.
  *
  * Called by radio_init() at startup with both external PAs off. Any additional
  * calls must run in a thread after flash/console initialization, with no

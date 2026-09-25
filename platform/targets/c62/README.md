@@ -73,7 +73,11 @@ Requests use three coarse buckets: `0 < power <= 1000` mW selects selector 0,
 5000 mW are rejected. A 100 mW request still selects the provisional 1 W duty.
 Invalid power/frequency or TX-disable leaves TX off. PWM driver success is
 required before PA enable. TX logs requested power, frequency and duty.
-**PWM stays at 1 kHz.** Watt labels are provisional, not measured output;
+**PWM now requests 100 kHz**, matching the stock trace, for comparison against
+the earlier 1 kHz measurements. Duty values are unchanged. Pulse widths are
+calculated in nanoseconds to avoid whole-microsecond duty quantization;
+actual timer resolution and waveform still require hardware verification.
+Watt labels are provisional, not measured output;
 verify with a dummy load and power meter. Selector indices are not proven
 ascending power levels; retaining selectors 2/3 does not expose extra levels.
 
