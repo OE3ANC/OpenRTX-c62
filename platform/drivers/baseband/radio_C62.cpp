@@ -19,19 +19,19 @@
 
 /**
  * Set TX power using PWM on pin A03
- * PWM period: 10 us (100 kHz), matching the traced stock firmware.
+ * PWM Period: 1000us (1kHz), adjustable duty cycle for power level
  *
  * @param power_percent: 0-100 (0 = min power, 100 = max power)
  * @return true if the PWM driver accepted the control
  */
 static bool set_tx_power(uint8_t power_percent)
 {
-    // Calculate in nanoseconds: whole microseconds would quantize duty
-    // to 10% steps at 100 kHz. The driver handles timer-cycle rounding.
-    constexpr uint32_t tx_pwm_period_ns = 10000;
-    uint32_t pulse_ns = tx_pwm_period_ns * power_percent / 100;
+    // Keep existing 1kHz PWM; changing to stock 100kHz is deferred.
+    // Calculate duty cycle (1000us period = 1kHz)
+    uint32_t period_us = 1000; // 1kHz PWM frequency
+    uint32_t pulse_us = (period_us * power_percent) / 100;
 
-    int ret = pwm_set_dt(&pwm_rf_apc, tx_pwm_period_ns, pulse_ns);
+    int ret = pwm_set_dt(&pwm_rf_apc, PWM_USEC(period_us), PWM_USEC(pulse_us));
 
     if (ret < 0) {
         printk("Failed to set TX power PWM: %d\n", ret);
@@ -39,21 +39,15 @@ static bool set_tx_power(uint8_t power_percent)
     return ret >= 0;
 }
 
-/* Starting estimates from measurements at 100 kHz PWM, not stock settings.
- * Columns: provisional 1 / 2.5 / 5 W. Tune these six percentages on hardware.
- * VHF at 145.550 MHz: 30/43/57% gave 1.1/1.4/2.5 W. Keep 30/57%;
- * extrapolating the last two points suggests 89% for 5 W (unmeasured).
- * UHF at 433.475 MHz: 31/52/74% gave 0.3/1.3/2.4 W. Interpolation gives
- * 46% for 1 W; extrapolation gives 76% for 2.5 W. The 5 W extrapolation
- * exceeds 100%, so that slot is capped at full drive, NOT a verified 5 W.
- * No frequency compensation: one row per hardware band. Requests between
- * nominal levels select the next bucket; this is not continuous calibration.
- */
+/* 
+    Very rough power calibration table. TODO -> Read actual calibration data from flash
+*/
 static int select_tx_power(uint32_t frequency_hz, uint32_t power_mw)
 {
     static const uint8_t duty_percent[2][3] = {
-        { 30, 57, 89 },  // VHF
-        { 46, 76, 100 }, // UHF
+                        // 1.0 2.5 5.0
+        { 25, 40, 60 }, // VHF
+        { 45, 55, 68 }, // UHF
     };
 
     if (power_mw == 0 || power_mw > 5000)
