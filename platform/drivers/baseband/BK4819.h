@@ -267,9 +267,11 @@ void bk4819_rtx_off(const struct BK4819 *dev);
  * @brief Disable all and enable CTCSS1
  *
  * @param dev: pointer to device data.
- * @param frequency
+ * @param frequency: tone frequency in 0.1 Hz units.
+ * @param gain: raw transmit gain, 0..127 (REG_51[6:0]).
  */
-void bk4819_enable_tx_ctcss(const struct BK4819 *dev, uint16_t frequency);
+void bk4819_enable_tx_ctcss(const struct BK4819 *dev, uint16_t frequency,
+                            uint8_t gain);
 
 /**
  * @brief Enable Rx CTCSS.
@@ -294,9 +296,10 @@ void bk4819_enable_ctcss2(const struct BK4819 *dev, uint16_t frequency);
  * @param code_type 0:positive code   1:negative code
  * @param bit_sel 0: 23bit          1:24bit
  * @param cdcss_code cdcss code
+ * @param gain: raw transmit gain, 0..127 (REG_51[6:0]).
  */
 void bk4819_enable_tx_cdcss(const struct BK4819 *dev, uint8_t code_type,
-                            uint8_t bit_sel, uint32_t cdcss_code);
+                            uint8_t bit_sel, uint32_t cdcss_code, uint8_t gain);
 
 /**
  * @brief Disable CTCSS/CDCSS

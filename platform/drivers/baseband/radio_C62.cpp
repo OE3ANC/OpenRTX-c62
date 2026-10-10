@@ -17,6 +17,9 @@
 #include <zephyr/drivers/pwm.h>
 #include <zephyr/kernel.h>
 
+/* Provisional sub-audio gain; deviation needs calibration. */
+static constexpr uint8_t ctcssTxGain = 74;
+
 /**
  * Set TX power using PWM on pin A03
  * PWM Period: 1000us (1kHz), adjustable duty cycle for power level
@@ -352,7 +355,7 @@ void radio_enableTx()
         apply_digital_profile(true);
 
     if (radioMode == OPMODE_FM && config->txToneEn) {
-        bk4819_enable_tx_ctcss(&c62_bk4819, config->txTone);
+        bk4819_enable_tx_ctcss(&c62_bk4819, config->txTone, ctcssTxGain);
     }
 
     if (config->txFrequency <= 174000000) {
