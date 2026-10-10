@@ -18,9 +18,7 @@ static int lsf_audio_init(void)
 {
     LOG_DBG("Initialize AudioService");
 
-    AudioSystem_initialize();
-
-    return 0;
+    return AudioSystem_initialize();
 }
 
 LSF_SERVICE_DEFINE(lsf_audio, lsf_audio_init);

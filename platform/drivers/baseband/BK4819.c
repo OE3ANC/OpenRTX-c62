@@ -134,6 +134,13 @@ void bk4819_init(const struct BK4819 *dev)
     BK4819_writeReg(dev, 0x29, 0xb4cb);
     BK4819_writeReg(dev, BK4819_REG_36, 0xdfbf);
     BK4819_writeReg(dev, BK4819_REG_47, 0x6040);
+
+    /* Enable only the microphone ADC for 250 ms, then restore the previous
+     * power state. Complete this settling sequence before returning. */
+    uint16_t power = BK4819_readReg(dev, BK4819_REG_30);
+    BK4819_writeReg(dev, BK4819_REG_30, BK4819_REG30_MIC_ADC_ENABLE);
+    delayMs(250);
+    BK4819_writeReg(dev, BK4819_REG_30, power);
 }
 
 uint8_t bk4819_int_get(const struct BK4819 *dev, bk4819_int_t interrupt)

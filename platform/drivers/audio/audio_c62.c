@@ -41,6 +41,9 @@ static void init_audio(void)
         return;
     gpio_pin_configure_dt(&speaker_enable, GPIO_OUTPUT_INACTIVE);
     gpio_pin_configure_dt(&dtmf_enable, GPIO_OUTPUT_INACTIVE);
+    /* The radio must settle before the DSP initializes the audio hardware. */
+    if (c62_audio_service_init() != 0)
+        return;
     /* DSP audio setup may alter the shared console configuration. */
     c62_restore_console();
     initialized = c62_stream_init() == 0;

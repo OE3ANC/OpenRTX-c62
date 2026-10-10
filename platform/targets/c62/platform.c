@@ -78,7 +78,8 @@ void platform_init_csk6()
     // Enable keyboard backlight
     gpio_pin_set_dt(&led_keyboard, 1);
 
-    /* Initialise BK4819 transceiver */
+    /* Complete BK4819 initialization and ADC settling before DSP/audio
+     * startup. This ordering fixes the observed 48 kHz FM capture fault. */
     bk4819_init(&c62_bk4819);
 
     /* Initialise audio */

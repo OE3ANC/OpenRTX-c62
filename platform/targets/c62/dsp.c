@@ -17,6 +17,8 @@ LOG_MODULE_REGISTER(dsp, LOG_LEVEL_DBG);
 #include <csk6_cm33/include/cache.h>
 #include <csk6_cm33/include/ClockManager.h>
 #include <csk6_cm33/include/SysManager.h>
+#include <hwconfig.h>
+#include "controller.h"
 
 #define AP_SYS_RAM_BANK_IDX 4
 #define AP_SYS_RAM_BANK_SIZE 0x00010000
@@ -120,4 +122,17 @@ static int lsf_dsp_init(void)
     return 0;
 }
 
-SYS_INIT(lsf_dsp_init, POST_KERNEL, CONFIG_LSF_DSP_INIT_PRIORITY);
+int c62_audio_service_init(void)
+{
+    /* Boot once, after board/radio initialization. Rebooting on stream reopen
+     * would invalidate SDK objects that still refer to DSP-owned memory. */
+    static bool attempted;
+    static int result;
+    if (!attempted) {
+        attempted = true;
+        result = lsf_dsp_init();
+        if (result == 0)
+            result = lsf_controller_init();
+    }
+    return result;
+}

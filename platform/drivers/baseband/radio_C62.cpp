@@ -45,7 +45,7 @@ static bool set_tx_power(uint8_t power_percent)
 static int select_tx_power(uint32_t frequency_hz, uint32_t power_mw)
 {
     static const uint8_t duty_percent[2][3] = {
-                        // 1.0 2.5 5.0
+        // 1.0 2.5 5.0
         { 25, 40, 60 }, // VHF
         { 45, 55, 68 }, // UHF
     };
@@ -218,13 +218,7 @@ void radio_init(const rtxStatus_t *rtxState)
     bk4819_gpio_pin_set(&c62_bk4819, GPIO_ALC_TX_LED,
                         false); // ALC / TX LED
 
-    /* MIC bias settles only with the ADC enabled and RX DSP disabled.
-     * Keep both external PAs off; this delay is paid at startup, not PTT.
-     */
-    uint16_t power = BK4819_readReg(&c62_bk4819, BK4819_REG_30);
-    BK4819_writeReg(&c62_bk4819, BK4819_REG_30, BK4819_REG30_MIC_ADC_ENABLE);
-    delayMs(250);
-    BK4819_writeReg(&c62_bk4819, BK4819_REG_30, power);
+    /* ADC settling is performed by bk4819_init before DSP boot. */
 }
 
 void radio_terminate()
@@ -349,8 +343,7 @@ void radio_enableTx()
     }
     printk("C62 TX: %lumW %luHz duty=%u%% "
            "PWM=100000Hz provisional\n",
-           (unsigned long)config->txPower,
-           (unsigned long)config->txFrequency,
+           (unsigned long)config->txPower, (unsigned long)config->txFrequency,
            (unsigned)duty_percent);
 
     bk4819_set_freq(&c62_bk4819, config->txFrequency);

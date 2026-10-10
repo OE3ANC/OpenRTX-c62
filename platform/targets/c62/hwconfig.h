@@ -59,6 +59,11 @@ extern const struct device *adc_dev;
 /** Restore console pins and UART settings around DSP audio initialization. */
 void c62_restore_console(void);
 
+/** Boot and connect DSP audio once, after BK4819 initialization/settling.
+ * Called with the audio board lock held. Returns zero on success.
+ */
+int c62_audio_service_init(void);
+
 #ifdef __cplusplus
 }
 #endif
